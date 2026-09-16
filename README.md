@@ -286,6 +286,164 @@ módulo
 
 Esto permite mantener la autoridad sobre credenciales en la capa estructural del ecosistema.
 
+## Almacenamiento local de secretos de usuario: KeePassXC
+
+Para usuarios de N.E.E.B.L.E.S. OS, `neebles-secrets` utilizará **KeePassXC** como almacén local de secretos persistentes cuando un módulo requiera este componente.
+
+KeePassXC es software libre y multiplataforma, disponible en Linux y Windows, y utiliza bases de datos `.kdbx`.
+
+La intención es no convertir N.E.E.B.L.E.S. en otro gestor de contraseñas ni reinventar una bóveda propia. `neebles-secrets` gobernará el contrato y la generación del material, mientras KeePassXC actuará como mecanismo de custodia local.
+
+El programa no tiene por qué formar parte permanente de una instalación limpia de N.E.E.B.L.E.S. OS. Si un módulo instalado declara dependencia de `neebles-secrets`, el sistema podrá instalar KeePassXC como dependencia y avisar al usuario de que ese módulo utilizará un almacén local de secretos.
+
+Las bases y archivos necesarios deberán vivir **fuera de las carpetas internas del ecosistema N.E.E.B.L.E.S.**. No deberán guardarse dentro de `/opt/neebles` ni confundirse con repositorios o settings internos de los módulos.
+
+Regla fundamental:
+
+```text
+¿existe el material de claves?
+├─ sí  → preservar; nunca sobrescribir automáticamente
+└─ no  → generar y registrar
+```
+
+Esto permite que una reinstalación, reparación o actualización no regenere accidentalmente una identidad criptográfica existente.
+
+## Dos caminos de integración con KeePassXC
+
+Actualmente se contemplan dos caminos técnicos de integración. La elección definitiva se realizará durante la implementación.
+
+### Camino 1 — `keepassxc-cli`
+
+KeePassXC ofrece `keepassxc-cli`, que permite automatizar operaciones sobre una base `.kdbx` desde procesos controlados.
+
+Conceptualmente:
+
+```text
+módulo
+↓
+neebles-secrets
+↓
+keepassxc-cli
+↓
+base .kdbx externa al ecosistema NEEBLES
+```
+
+Este camino permite mantener la integración explícita, automatizable y acotada a una base administrada por `neebles-secrets`.
+
+### Camino 2 — Secret Service / D-Bus de KeePassXC
+
+KeePassXC también puede integrarse mediante interfaces de escritorio basadas en D-Bus / Secret Service.
+
+Conceptualmente:
+
+```text
+módulo
+↓
+neebles-secrets
+↓
+D-Bus / Secret Service
+↓
+KeePassXC
+```
+
+Este camino puede resultar útil cuando convenga integrarse con mecanismos estándar de sesión de usuario. Si se utiliza, el usuario deberá ser informado porque implica una integración más directa con el entorno de escritorio.
+
+Ninguno de los módulos consumidores deberá acoplarse directamente a KeePassXC. Ambos caminos deben permanecer detrás del contrato de `neebles-secrets`.
+
+## Separación entre desktop y backend
+
+El problema de custodia de secretos para un usuario de N.E.E.B.L.E.S. OS no es necesariamente el mismo que el de un backend o servidor.
+
+En desktop se priorizará KeePassXC como almacén persistente de usuario.
+
+En backend, `neebles-secrets` podrá admitir providers distintos, por ejemplo:
+
+```text
+.env
+systemd credentials
+variables de entorno
+vaults externos
+providers futuros
+```
+
+Los módulos no deberían necesitar conocer qué provider físico está detrás.
+
+## Material efímero por transacción
+
+`neebles-secrets` deberá distinguir entre material persistente y material efímero.
+
+Conceptualmente:
+
+```text
+persistent material
+└─ identidad / claves de largo plazo
+
+ephemeral material
+└─ nuevo material por transacción
+   ↓
+   usar
+   ↓
+   descartar
+```
+
+Cuando una operación requiera cifrado reversible, la intención es poder generar material fresco por transacción para evitar reutilización innecesaria de claves o nonces y reducir correlación entre operaciones.
+
+Los algoritmos y construcciones concretas deberán usar primitivas criptográficas estándar y auditadas; N.E.E.B.L.E.S. abstraerá el contrato, no inventará nuevos algoritmos criptográficos.
+
+## Respaldo y recuperación
+
+Un secreto persistente útil debe poder sobrevivir a una reinstalación del sistema.
+
+Los módulos que dependan de `neebles-secrets` deberán poder informar al usuario qué material externo necesita conservar para recuperar su identidad o sus datos después de formatear.
+
+La intención es que `neebles restore` pueda integrar en el futuro el material externo administrado por `neebles-secrets` dentro de sus respaldos, sin que `neebles-installer` necesite conocer los detalles internos de KeePassXC.
+
+Conceptualmente:
+
+```text
+neebles restore
+↓
+pregunta a neebles-secrets
+↓
+¿qué material externo pertenece a este módulo?
+↓
+respalda / restaura
+```
+
+`neebles-secrets` deberá conservar la autoridad sobre las rutas, identificadores y artefactos necesarios.
+
+## Respaldo remoto opcional con Google Drive
+
+También se contempla conectar `neebles-secrets` con Google Drive para ofrecer respaldo automático del material crítico y reducir el riesgo de pérdida por olvido del usuario.
+
+El respaldo remoto no deberá subir una clave sensible en texto plano.
+
+Conceptualmente:
+
+```text
+key local
+↓
+protección / wrapping de recuperación
+↓
+artefacto cifrado de backup
+↓
+Google Drive
+```
+
+El material utilizado para recuperar el backup no debe depender únicamente de la misma clave que está siendo respaldada, para evitar una dependencia circular.
+
+Google Drive deberá considerarse un provider de respaldo, no la autoridad criptográfica.
+
+La arquitectura deberá permitir en el futuro otros providers de backup sin modificar los módulos consumidores:
+
+```text
+google_drive
+local_export
+nextcloud
+s3
+provider futuro
+```
+
 ## Evolución tecnológica
 
 Uno de los objetivos fundamentales es evitar acoplar N.E.E.B.L.E.S. a un algoritmo específico.
