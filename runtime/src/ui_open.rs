@@ -68,7 +68,7 @@ fn module_root()->Result<PathBuf,String>{
         .map_err(|e|e.to_string())?;
     if m.get("name").and_then(Value::as_str)!=Some(MODULE)
         ||m.get("version").and_then(Value::as_str)!=Some("1.0.0")
-        ||m.get("entrypoint").and_then(Value::as_str)!=Some("runtime/neebles-secrets") {
+        ||m.get("entrypoint").and_then(Value::as_str)!=Some("runtime/neebles-secrets-ui") {
         return Err("installed Secrets identity mismatch".into());
     }
     Ok(root.to_path_buf())
@@ -118,6 +118,11 @@ fn run()->Result<(),String>{
     writer.set_read_timeout(Some(Duration::from_secs(12))).map_err(|e|e.to_string())?;
     write_frame(&mut writer,&json!({"type":"register","protocol":1,"module":MODULE,"session_id":session,"endpoints":{"commands":[]}}))?;
     let registered=read_frame(&mut writer)?;
+    if registered.get("type").and_then(Value::as_str)==Some("error") {
+        let details=registered.get("error").and_then(|e|e.get("message"))
+            .and_then(Value::as_str).unwrap_or("Boss rejected registration without reason");
+        return Err(format!("Boss rejected Secrets IPC registration: {details}"));
+    }
     require_message(&registered,&session,"registered")?;
     if registered.get("protocol").and_then(Value::as_u64)!=Some(1){return Err("Boss IPC protocol mismatch".into());}
     let topics=["module.lifecycle","settings.neebles-secrets"];

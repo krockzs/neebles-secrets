@@ -160,7 +160,7 @@ impl VaultController {
                     .is_some_and(|item| {
                         item.get("schema").and_then(Value::as_u64)==Some(4)
                         && item.get("name").and_then(Value::as_str)==Some("neebles-secrets")
-                        && item.get("entrypoint").and_then(Value::as_str)==Some("runtime/neebles-secrets")
+                        && item.get("entrypoint").and_then(Value::as_str)==Some("runtime/neebles-secrets-ui")
                     })
             },
             _ => false

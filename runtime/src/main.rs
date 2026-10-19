@@ -238,7 +238,7 @@ fn serve_from_certified_world() -> Result<(), String> {
     ).map_err(|_|"invalid installed Secrets manifest")?;
     if data.get("schema").and_then(Value::as_u64) != Some(4)
         || data.get("name").and_then(Value::as_str) != Some("neebles-secrets")
-        || data.get("entrypoint").and_then(Value::as_str) != Some("runtime/neebles-secrets") {
+        || data.get("entrypoint").and_then(Value::as_str) != Some("runtime/neebles-secrets-ui") {
         return Err("installed Secrets module identity is invalid".into());
     }
     // Boss already stages and verifies each named module rootfs on publication.
@@ -278,7 +278,16 @@ fn serve_from_certified_world() -> Result<(), String> {
     let mut cmd = Command::new("/usr/bin/bwrap");
     cmd.arg("--die-with-parent")
         .arg("--clearenv")
-        .arg("--ro-bind").arg(&world).arg("/")
+        // F35: temporary writable namespace root; only certified runtime trees
+        // are bind-mounted read-only. F30 ro-bound "/" before creating /opt.
+        .arg("--tmpfs").arg("/")
+        .arg("--ro-bind").arg(world.join("usr")).arg("/usr")
+        .arg("--ro-bind").arg(world.join("etc")).arg("/etc")
+        .arg("--ro-bind").arg(world.join("var")).arg("/var")
+        .arg("--symlink").arg("usr/bin").arg("/bin")
+        .arg("--symlink").arg("usr/sbin").arg("/sbin")
+        .arg("--symlink").arg("usr/lib").arg("/lib")
+        .arg("--symlink").arg("/usr/lib/x86_64-linux-gnu").arg("/lib64")
         .arg("--dev").arg("/dev")
         .arg("--proc").arg("/proc")
         .arg("--tmpfs").arg("/tmp")
