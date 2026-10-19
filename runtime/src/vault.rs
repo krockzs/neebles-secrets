@@ -149,7 +149,23 @@ impl VaultController {
     pub fn initialized(&self)->Result<bool,String>{validate_vault(&self.general())}
     pub fn status(&self)->Result<Value,String>{
         let initialized=self.initialized()?;
-        Ok(json!({"locked":self.unlocked.is_none(),"initialized":initialized,"vaults_ready":initialized&&self.unlocked.is_some(),"service":"neebles-secrets","protocol":1}))
+        // A daemon/socket can outlive module Uninstall. Requiring the canonical
+        // installed manifest prevents orphan F17-style processes from passing
+        // consumers' installation prerequisites.
+        let manifest=std::path::Path::new("/opt/neebles/modules/neebles-secrets/manifest.json");
+        let installed=match fs::symlink_metadata(manifest) {
+            Ok(meta) if meta.is_file() && !meta.file_type().is_symlink() => {
+                fs::read(manifest).ok()
+                    .and_then(|bytes| serde_json::from_slice::<Value>(&bytes).ok())
+                    .is_some_and(|item| {
+                        item.get("schema").and_then(Value::as_u64)==Some(4)
+                        && item.get("name").and_then(Value::as_str)==Some("neebles-secrets")
+                        && item.get("entrypoint").and_then(Value::as_str)==Some("runtime/neebles-secrets")
+                    })
+            },
+            _ => false
+        };
+        Ok(json!({"locked":self.unlocked.is_none(),"initialized":initialized,"installed":installed,"vaults_ready":initialized&&self.unlocked.is_some(),"service":"neebles-secrets","protocol":1}))
     }
     pub fn setup(&mut self, password:&str)->Result<Value,String>{
         if self.initialized()? {return Err("already_initialized".into());}
@@ -215,6 +231,13 @@ impl VaultController {
         let master=self.unlocked.as_ref().ok_or("vault_locked")?;
         if !self.initialized()? {return Err("setup_required".into());}
         let created=create_once(&self.directory,module,master.as_bytes())?;
+        // Existing KDBX files must not merely have a correct header: verify
+        // they are actually decryptable with the global master key.
+        // Failure never erases or replaces the user's existing vault.
+        if !created {
+            let target=self.directory.join(format!("vault-{module}.kdbx"));
+            db_verify(&target,master.as_bytes())?;
+        }
         Ok(json!({"module":module,"created":created,"exists":true}))
     }
 }

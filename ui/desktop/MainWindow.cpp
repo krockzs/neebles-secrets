@@ -13,7 +13,8 @@
 #include <QJsonObject>
 #include <QLabel>
 #include <QLineEdit>
-#include <QInputDialog>
+#include <QDialog>
+#include <QDialogButtonBox>
 #include <QTimer>
 #include <QLocalSocket>
 #include <QMessageBox>
@@ -38,6 +39,83 @@ QLabel* note(const QString& message,QWidget* parent){
     label->setWordWrap(true);label->setObjectName(QStringLiteral("information"));return label;
 }
 QString errorText(const QJsonObject& value){return value.value(QStringLiteral("error")).toString(QStringLiteral("Unknown error"));}
+// F25: one modal with two master-key fields for first setup, independent eyes.
+// It never stores the master key in Settings, files, command-line arguments or logs.
+static bool askMasterKey(QWidget* parent, bool setup, QString* output) {
+    QDialog dialog(parent);
+    dialog.setWindowTitle(setup ? QStringLiteral("Configurar NEEBLES Secrets")
+                               : QStringLiteral("Desbloquear NEEBLES Secrets"));
+    auto* layout = new QVBoxLayout(&dialog);
+    layout->addWidget(new QLabel(setup
+        ? QStringLiteral("Crea una clave maestra para vault-general (mínimo 8 caracteres).")
+        : QStringLiteral("Introduce tu clave maestra existente."), &dialog));
+    auto* form = new QFormLayout();
+    auto makeField = [&dialog](QLineEdit** field) -> QWidget* {
+        auto* widget = new QWidget(&dialog);
+        auto* row = new QHBoxLayout(widget);
+        row->setContentsMargins(0, 0, 0, 0);
+        *field = new QLineEdit(widget);
+        (*field)->setEchoMode(QLineEdit::Password);
+        (*field)->setMinimumWidth(280);
+        row->addWidget(*field);
+        auto* eye = new QPushButton(QStringLiteral("👁"), widget);
+        eye->setCheckable(true);
+        eye->setToolTip(QStringLiteral("Mostrar u ocultar clave"));
+        eye->setAccessibleName(QStringLiteral("Mostrar u ocultar clave"));
+        eye->setMaximumWidth(45);
+        QObject::connect(eye, &QPushButton::toggled, widget,
+            [editor=*field](bool checked) {
+                editor->setEchoMode(checked ? QLineEdit::Normal : QLineEdit::Password);
+            });
+        row->addWidget(eye);
+        return widget;
+    };
+    QLineEdit* key = nullptr;
+    QLineEdit* confirmation = nullptr;
+    form->addRow(QStringLiteral("Clave maestra:"), makeField(&key));
+    if (setup) {
+        form->addRow(QStringLiteral("Confirmar clave:"), makeField(&confirmation));
+    }
+    layout->addLayout(form);
+    auto* notice = new QLabel(&dialog);
+    notice->setWordWrap(true);
+    layout->addWidget(notice);
+    auto* buttons = new QDialogButtonBox(QDialogButtonBox::Ok | QDialogButtonBox::Cancel, &dialog);
+    layout->addWidget(buttons);
+    QObject::connect(buttons, &QDialogButtonBox::rejected, &dialog, &QDialog::reject);
+    QObject::connect(buttons, &QDialogButtonBox::accepted, &dialog, [&]() {
+        if (setup) {
+            const auto bytes = key->text().toUtf8();
+            if (bytes.size() < 8 || bytes.size() > 512) {
+                notice->setText(QStringLiteral("La clave debe tener entre 8 y 512 bytes UTF-8."));
+                return;
+            }
+            if (key->text() != confirmation->text()) {
+                notice->setText(QStringLiteral("Las claves no coinciden."));
+                return;
+            }
+        }
+        if (key->text().contains(QChar('\n')) ||
+            key->text().contains(QChar('\r')) ||
+            key->text().contains(QChar('\0'))) {
+            notice->setText(QStringLiteral("La clave contiene caracteres no permitidos."));
+            return;
+        }
+        if (key->text().isEmpty()) {
+            notice->setText(QStringLiteral("Introduce una clave maestra."));
+            return;
+        }
+        *output = key->text();
+        dialog.accept();
+    });
+    key->setFocus();
+    const bool accepted = dialog.exec() == QDialog::Accepted;
+    // Clear widget-owned copies before QDialog destroys them.
+    key->clear();
+    if (confirmation) confirmation->clear();
+    if (!accepted) output->clear();
+    return accepted;
+}
 }
 MainWindow::MainWindow(QString moduleRoot,QWidget* parent):QMainWindow(parent),root_(std::move(moduleRoot)){
     setWindowTitle(QStringLiteral("N.E.E.B.L.E.S. Secrets — 1.0.0"));
@@ -74,15 +152,19 @@ MainWindow::MainWindow(QString moduleRoot,QWidget* parent):QMainWindow(parent),r
         navigation_.append(button);left->addWidget(button);
         connect(button,&QPushButton::clicked,this,[this,i](){showView(i);});
     }
-    left->addStretch();left->addWidget(note(QStringLiteral("Secrets v1.0.0 — F10"),sidebar));
+    left->addStretch();
+    unlock_=new QPushButton(QStringLiteral("🔒  Desbloquear"),sidebar);
+    unlock_->setObjectName(QStringLiteral("unlockButton"));
+    unlock_->setVisible(false); // never show before vault-general exists
+    left->addWidget(unlock_);
+    left->addWidget(note(QStringLiteral("Secrets v1.0.0"),sidebar));
     row->addWidget(sidebar);
     auto* right=new QWidget(root);auto* rightLayout=new QVBoxLayout(right);
     auto* header=new QHBoxLayout();
     header->addWidget(note(QStringLiteral("N.E.E.B.L.E.S. Secrets"),right));
     header->addStretch();
     status_=new QLabel(QStringLiteral("Locked"),right);header->addWidget(status_);
-    unlock_=new QPushButton(QStringLiteral("🔒  Desbloquear"),right);unlock_->setObjectName(QStringLiteral("unlockButton"));
-    header->addWidget(unlock_);rightLayout->addLayout(header);
+    rightLayout->addLayout(header);
     tabs_=new QTabWidget(right);tabs_->setTabsClosable(false);tabs_->setMovable(false);tabs_->setDocumentMode(true);
     views_=new QStackedWidget(tabs_);
     buildDashboard();buildQuick();buildVaults();
@@ -249,19 +331,10 @@ void MainWindow::toggleUnlock(){
         refreshStatus();return;
     }
     const bool setup=!data.value(QStringLiteral("initialized")).toBool();
-    bool accepted=false;
-    QString password=QInputDialog::getText(this,QStringLiteral("NEEBLES Secrets"),
-        setup?QStringLiteral("Cree su contraseña maestra global KeePass (mínimo 8 caracteres):"):
-              QStringLiteral("Contraseña maestra global KeePass:"),
-        QLineEdit::Password,QString(),&accepted);
-    if(!accepted){password.fill(QChar('\0'));return;}
-    if(setup){
-        bool confirmed=false;
-        QString confirmation=QInputDialog::getText(this,QStringLiteral("Confirmar contraseña"),
-            QStringLiteral("Repita la contraseña maestra:"),QLineEdit::Password,QString(),&confirmed);
-        const bool equal=confirmed&&password==confirmation;
-        confirmation.fill(QChar('\0'));
-        if(!equal){password.fill(QChar('\0'));QMessageBox::warning(this,QStringLiteral("Secrets"),QStringLiteral("Las contraseñas no coinciden. No se creó ninguna bóveda."));return;}
+    QString password;
+    if(!askMasterKey(this,setup,&password)){
+        password.fill(QChar('\0'));
+        return; // Cancel: no vault created. Next Open prompts again.
     }
     QJsonObject request{{QStringLiteral("op"),setup?QStringLiteral("vault.setup"):QStringLiteral("vault.unlock")},
                         {QStringLiteral("password"),password}};
@@ -275,7 +348,7 @@ void MainWindow::toggleUnlock(){
 void MainWindow::refreshStatus(){
     QString error;const auto result=call(QJsonObject{{QStringLiteral("op"),QStringLiteral("vault.status")}},&error);
     if(result.isEmpty()||!result.value(QStringLiteral("ok")).toBool()){
-        status_->setText(QStringLiteral("● Offline"));unlock_->setEnabled(false);
+        status_->setText(QStringLiteral("● Offline"));unlock_->setEnabled(false);unlock_->setVisible(false);
         if(vaultMessage_)vaultMessage_->setText(QStringLiteral("Backend desconectado. Los Vaults no están disponibles."));
         statusBar()->showMessage(error.isEmpty()?QStringLiteral("Backend desconectado"):error);
         return;
@@ -284,7 +357,8 @@ void MainWindow::refreshStatus(){
     const bool initialized=data.value(QStringLiteral("initialized")).toBool();
     const bool locked=data.value(QStringLiteral("locked")).toBool();
     status_->setText(locked?QStringLiteral("● Locked"):QStringLiteral("● Unlocked"));
-    unlock_->setEnabled(true);
+    unlock_->setEnabled(initialized);
+    unlock_->setVisible(initialized);
     unlock_->setText(locked?QStringLiteral("🔒  Desbloquear"):QStringLiteral("🔓  Bloquear"));
     if(vaultMessage_)vaultMessage_->setText(!initialized?
         QStringLiteral("Configuración inicial pendiente. Solo se creará vault-general.kdbx."):

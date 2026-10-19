@@ -16,9 +16,26 @@
   "settings": "settings/default.json",
   "uninstall": {
     "schema": 1,
-    "hardcoded": {},
+    "hardcoded": {
+      "session_service": "neebles-neebles-secrets-daemon.service"
+    },
     "main": "governor",
-    "extras": [],
+    "extras": [
+      {
+        "id": "secrets-daemon",
+        "type": "service",
+        "provider": "systemd-user",
+        "name": "$hardcoded.session_service",
+        "exec_start": "/opt/neebles/modules/neebles-secrets/runtime/neebles-secrets --serve",
+        "required": false,
+        "stop": {
+          "disable": true,
+          "timeout_ms": 5000
+        },
+        "verify": "inactive",
+        "remove": true
+      }
+    ],
     "cleanup": [
       {
         "id": "local-settings",

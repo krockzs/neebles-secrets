@@ -9,7 +9,7 @@ use std::io::{Read, Write};
 use std::os::unix::fs::{FileTypeExt, MetadataExt, PermissionsExt};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
-use std::process::ExitCode;
+use std::process::{Command, ExitCode};
 use std::time::Duration;
 
 const MAX_FRAME: usize = 16 * 1024;
@@ -220,10 +220,98 @@ fn request(input: &Value) -> Result<Value,String> {
     rpc_write(&mut stream,input)?;
     rpc_read(&mut stream)
 }
+// F30: systemd --user ExecStart stays module-owned and unchanged. The wrapper
+// re-enters the pinned installed KeePass rootfs before the socket is bound.
+// No KeePass package is installed in the host. No new master vault is made.
+fn serve_from_certified_world() -> Result<(), String> {
+    if std::env::var_os("NEEBLES_SECRETS_INSIDE_WORLD").as_deref()
+        == Some(std::ffi::OsStr::new("1")) {
+        return serve();
+    }
+    if uid() == 0 {
+        return Err("Secrets service must run as the desktop user, not root".into());
+    }
+    let module = Path::new("/opt/neebles/modules/neebles-secrets");
+    let manifest = module.join("manifest.json");
+    let data:Value = serde_json::from_slice(
+        &fs::read(&manifest).map_err(|_|"installed Secrets manifest unavailable")?
+    ).map_err(|_|"invalid installed Secrets manifest")?;
+    if data.get("schema").and_then(Value::as_u64) != Some(4)
+        || data.get("name").and_then(Value::as_str) != Some("neebles-secrets")
+        || data.get("entrypoint").and_then(Value::as_str) != Some("runtime/neebles-secrets") {
+        return Err("installed Secrets module identity is invalid".into());
+    }
+    // Boss already stages and verifies each named module rootfs on publication.
+    // F30 consumes ONLY the selected installed KeePass material, not host apt.
+    let world = module.join("rootfs/keepass-full/rootfs");
+    let cli = world.join("usr/bin/keepassxc-cli");
+    let cli_meta = fs::symlink_metadata(&cli)
+        .map_err(|_|"certified KeePass world has no keepassxc-cli")?;
+    if !cli_meta.is_file() || cli_meta.file_type().is_symlink() {
+        return Err("certified KeePass executable must be a regular file".into());
+    }
+    let runtime = required_runtime_dir()?;
+    let home = PathBuf::from(std::env::var_os("HOME")
+        .ok_or("HOME is required for the desktop vault storage")?);
+    if !home.is_absolute() {
+        return Err("desktop HOME must be absolute".into());
+    }
+    let home_meta = fs::symlink_metadata(&home)
+        .map_err(|_|"desktop HOME is not accessible")?;
+    if !home_meta.is_dir() || home_meta.file_type().is_symlink()
+        || home_meta.uid() != uid() {
+        return Err("desktop HOME ownership or type is invalid".into());
+    }
+    let user_data = home.join(".local/share/neebles-secrets");
+    if !user_data.exists() {
+        fs::create_dir_all(&user_data)
+            .map_err(|_|"cannot create Secrets data directory")?;
+        fs::set_permissions(&user_data,fs::Permissions::from_mode(0o700))
+            .map_err(|_|"cannot secure Secrets data directory")?;
+    }
+    let data_meta = fs::symlink_metadata(&user_data)
+        .map_err(|_|"Secrets data directory cannot be inspected")?;
+    if !data_meta.is_dir() || data_meta.file_type().is_symlink()
+        || data_meta.uid() != uid() || data_meta.permissions().mode() & 0o077 != 0 {
+        return Err("Secrets data directory must be owned and private (0700)".into());
+    }
+    let mut cmd = Command::new("/usr/bin/bwrap");
+    cmd.arg("--die-with-parent")
+        .arg("--clearenv")
+        .arg("--ro-bind").arg(&world).arg("/")
+        .arg("--dev").arg("/dev")
+        .arg("--proc").arg("/proc")
+        .arg("--tmpfs").arg("/tmp")
+        .arg("--dir").arg("/opt")
+        .arg("--dir").arg("/opt/neebles")
+        .arg("--dir").arg("/opt/neebles/modules")
+        .arg("--ro-bind").arg(module).arg(module)
+        .arg("--dir").arg("/run")
+        .arg("--dir").arg("/run/user")
+        .arg("--bind").arg(&runtime).arg(&runtime)
+        .arg("--dir").arg("/vault-data")
+        .arg("--bind").arg(&user_data).arg("/vault-data/neebles-secrets")
+        .arg("--dir").arg("/home")
+        .arg("--dir").arg("/home/neebles")
+        .arg("--setenv").arg("HOME").arg("/home/neebles")
+        .arg("--setenv").arg("XDG_DATA_HOME").arg("/vault-data")
+        .arg("--setenv").arg("XDG_RUNTIME_DIR").arg(&runtime)
+        .arg("--setenv").arg("NEEBLES_SECRETS_INSIDE_WORLD").arg("1")
+        .arg("--chdir").arg("/home/neebles")
+        .arg(module.join("runtime/neebles-secrets"))
+        .arg("--serve");
+    // Remain the systemd main process until the daemon exits, so failures
+    // reach Restart=on-failure. The internal daemon still owns the socket.
+    let status = cmd.status()
+        .map_err(|e|format!("cannot enter certified KeePass runtime: {e}"))?;
+    if status.success() { Ok(()) }
+    else { Err(format!("certified Secrets daemon exited: {status}")) }
+}
+
 fn main_run() -> Result<(),String> {
     let args:Vec<String>=std::env::args().skip(1).collect();
     match args.as_slice() {
-        [cmd] if cmd=="--serve" => serve(),
+        [cmd] if cmd=="--serve" => serve_from_certified_world(),
         [cmd] if cmd=="--status" => {
             // Status contains no secrets and is suitable for shell smoke checks.
             let value=request(&json!({"op":"status"}))?;
