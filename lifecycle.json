@@ -4,7 +4,8 @@
     "governor.update": "update",
     "governor.uninstall": "uninstall",
     "governor.enable": "enable",
-    "governor.disable": "disable"
+    "governor.disable": "disable",
+    "governor.open": "open"
   },
   "require": {},
   "objects": {},
@@ -23,6 +24,19 @@
     },
     "disable": {
       "operations": {}
+    },
+    "open": {
+      "operations": {
+        "launch-ui": {
+          "artillery": "boss.workspace_execution",
+          "objective": "construction.step",
+          "munition": {
+            "step": "open-ui"
+          },
+          "tactics": {},
+          "intelligence": {}
+        }
+      }
     }
   }
 }

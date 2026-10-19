@@ -8,5 +8,6 @@
   "vault.lock": "Bloquear bóveda",
   "secrets.title": "Secretos",
   "crypto.title": "Operaciones criptográficas",
-  "errors.not_implemented": "Función todavía no implementada"
+  "errors.not_implemented": "Función todavía no implementada",
+  "surface.open": "Abrir NEEBLES Secrets"
 }

@@ -20,3 +20,6 @@ __pycache__/
 # Informes locales
 *.log
 .cache/
+
+# Cargo output from Secrets Rust runtime
+/runtime/target/

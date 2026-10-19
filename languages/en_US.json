@@ -8,5 +8,6 @@
   "vault.lock": "Lock vault",
   "secrets.title": "Secrets",
   "crypto.title": "Cryptographic operations",
-  "errors.not_implemented": "Feature not yet implemented"
+  "errors.not_implemented": "Feature not yet implemented",
+  "surface.open": "Open NEEBLES Secrets"
 }
