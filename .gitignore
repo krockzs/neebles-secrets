@@ -1,0 +1,22 @@
+# Artefactos de compilación (tecnología pendiente)
+/target/
+/build/
+/dist/
+__pycache__/
+*.pyc
+
+# Secrets reales: jamás publicar bóvedas, llaves o credenciales
+*.kdbx
+*.key
+*.pem
+*.p12
+*.pfx
+.env
+.env.*
+!.env.example
+*.secret
+*.secrets
+
+# Informes locales
+*.log
+.cache/

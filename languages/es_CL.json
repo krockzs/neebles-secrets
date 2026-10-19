@@ -1,0 +1,12 @@
+{
+  "app.title": "N.E.E.B.L.E.S. Secrets",
+  "app.subtitle": "Servicios criptográficos y bóveda segura",
+  "vault.title": "Bóveda",
+  "vault.locked": "Bloqueada",
+  "vault.unlocked": "Desbloqueada",
+  "vault.unlock": "Desbloquear bóveda",
+  "vault.lock": "Bloquear bóveda",
+  "secrets.title": "Secretos",
+  "crypto.title": "Operaciones criptográficas",
+  "errors.not_implemented": "Función todavía no implementada"
+}

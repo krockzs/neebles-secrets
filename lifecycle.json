@@ -1,0 +1,28 @@
+{
+  "hardcoded": {
+    "governor.install": "install",
+    "governor.update": "update",
+    "governor.uninstall": "uninstall",
+    "governor.enable": "enable",
+    "governor.disable": "disable"
+  },
+  "require": {},
+  "objects": {},
+  "transitions": {
+    "install": {
+      "operations": {}
+    },
+    "update": {
+      "operations": {}
+    },
+    "uninstall": {
+      "operations": {}
+    },
+    "enable": {
+      "operations": {}
+    },
+    "disable": {
+      "operations": {}
+    }
+  }
+}

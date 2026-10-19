@@ -1,0 +1,12 @@
+{
+  "app.title": "N.E.E.B.L.E.S. Secrets",
+  "app.subtitle": "Cryptographic services and secure vault",
+  "vault.title": "Vault",
+  "vault.locked": "Locked",
+  "vault.unlocked": "Unlocked",
+  "vault.unlock": "Unlock vault",
+  "vault.lock": "Lock vault",
+  "secrets.title": "Secrets",
+  "crypto.title": "Cryptographic operations",
+  "errors.not_implemented": "Feature not yet implemented"
+}

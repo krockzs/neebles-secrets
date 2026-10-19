@@ -1,0 +1,8 @@
+{
+  "hardcoded": {
+    "module": "neebles-secrets"
+  },
+  "ui": {
+    "language": "en_US"
+  }
+}

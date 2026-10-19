@@ -1,0 +1,36 @@
+{
+  "schema": 4,
+  "name": "neebles-secrets",
+  "version": "1.0.0",
+  "entrypoint": "runtime/neebles-secrets",
+  "lifecycle": "lifecycle.json",
+  "surfaces": "surfaces.json",
+  "contracts": [
+    {
+      "type": "commands",
+      "file": "contracts/commands.json",
+      "schema": 1,
+      "enabled": true
+    }
+  ],
+  "settings": "settings/default.json",
+  "uninstall": {
+    "schema": 1,
+    "hardcoded": {},
+    "main": "governor",
+    "extras": [],
+    "cleanup": [
+      {
+        "id": "local-settings",
+        "type": "settings",
+        "ref": "manifest.settings",
+        "policy": "user-choice"
+      }
+    ],
+    "failure": {
+      "unknown_process_owner": "abort",
+      "resource_still_running": "abort",
+      "cleanup_error": "abort"
+    }
+  }
+}

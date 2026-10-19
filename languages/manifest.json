@@ -1,0 +1,14 @@
+{
+  "schema": 1,
+  "default": "en_US",
+  "languages": [
+    {
+      "code": "en_US",
+      "file": "en_US.json"
+    },
+    {
+      "code": "es_CL",
+      "file": "es_CL.json"
+    }
+  ]
+}
