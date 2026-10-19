@@ -11,7 +11,15 @@
   "objects": {},
   "transitions": {
     "install": {
-      "operations": {}
+      "operations": {
+        "activate-user-service": {
+          "artillery": "boss.user_service",
+          "objective": "install",
+          "munition": { "resource": "secrets-daemon" },
+          "tactics": {},
+          "intelligence": {}
+        }
+      }
     },
     "update": {
       "operations": {}
