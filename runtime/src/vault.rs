@@ -128,6 +128,15 @@ fn create_once(dir:&Path,module:&str,password:&[u8]) -> Result<bool,String> {
     let _=fs::remove_file(&temp);
     result
 }
+// Contract destined for the authenticated Boss module IPC. Values are opaque strings.
+// An uninitialized vault must never be reported as unlocked.
+fn public_boss_variables(initialized: bool, locked: bool) -> Value {
+    json!({
+        "master_key": if initialized { "true" } else { "false" },
+        "unblock": if initialized && !locked { "true" } else { "false" },
+    })
+}
+
 impl VaultController {
     pub fn new()->Result<Self,String>{
         let home=std::env::var_os("HOME").ok_or("HOME is required")?;
@@ -165,7 +174,8 @@ impl VaultController {
             },
             _ => false
         };
-        Ok(json!({"locked":self.unlocked.is_none(),"initialized":initialized,"installed":installed,"vaults_ready":initialized&&self.unlocked.is_some(),"service":"neebles-secrets","protocol":1}))
+        Ok(json!({"locked":self.unlocked.is_none(),"initialized":initialized,"installed":installed,"vaults_ready":initialized&&self.unlocked.is_some(),"service":"neebles-secrets","protocol":1,
+                  "boss_variables":public_boss_variables(initialized,self.unlocked.is_none())}))
     }
     pub fn setup(&mut self, password:&str)->Result<Value,String>{
         if self.initialized()? {return Err("already_initialized".into());}
@@ -244,6 +254,20 @@ impl VaultController {
 
 #[cfg(test)] mod tests {
     use super::*;
+    #[test] fn boss_states_are_strings_and_fail_closed() {
+        let unconfigured = public_boss_variables(false, true);
+        assert_eq!(unconfigured["master_key"], "false");
+        assert_eq!(unconfigured["unblock"], "false");
+        let inconsistent = public_boss_variables(false, false);
+        assert_eq!(inconsistent["unblock"], "false");
+        let locked = public_boss_variables(true, true);
+        assert_eq!(locked["master_key"], "true");
+        assert_eq!(locked["unblock"], "false");
+        let unlocked = public_boss_variables(true, false);
+        assert_eq!(unlocked["master_key"], "true");
+        assert_eq!(unlocked["unblock"], "true");
+        assert_eq!(unlocked.as_object().unwrap().len(), 2);
+    }
     #[test] fn module_names_cannot_escape_namespace(){
         for name in ["../x","general","neebles/evil","neebles_connect", "","-evil","neebles-", "UPPER"]{assert!(!valid_module(name));}
         for name in ["neebles-connect","neebles-db","proxy"]{assert!(valid_module(name));}

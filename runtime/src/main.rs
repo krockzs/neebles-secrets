@@ -1,6 +1,7 @@
 //! NEEBLES Secrets F10: session-local Quick generator and locked vault boundary.
 //! No vault is opened, decrypted or written in F10. Never log generated secrets.
 mod vault;
+mod boss_publisher;
 use vault::VaultController;
 use std::sync::{Arc, Mutex};
 use serde_json::{json, Value};
@@ -311,8 +312,20 @@ fn serve_from_certified_world() -> Result<(), String> {
         .arg("--serve");
     // Remain the systemd main process until the daemon exits, so failures
     // reach Restart=on-failure. The internal daemon still owns the socket.
-    let status = cmd.status()
-        .map_err(|e|format!("cannot enter certified KeePass runtime: {e}"))?;
+    // The systemd-owned outer process is the only Boss service publisher.
+    // The inner KeePass daemon stays in bwrap, with no Boss socket mounted.
+    // The outer process reads only non-secret status flags through Secrets IPC.
+    let publishing = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true));
+    let publisher_flag = std::sync::Arc::clone(&publishing);
+    let publisher = std::thread::Builder::new()
+        .name("secrets-boss-publisher".to_string())
+        .spawn(move || boss_publisher::run(publisher_flag))
+        .map_err(|e| format!("cannot create Boss publisher worker: {e}"))?;
+
+    let result = cmd.status();
+    publishing.store(false, std::sync::atomic::Ordering::Release);
+    let _ = publisher.join();
+    let status = result.map_err(|e|format!("cannot enter certified KeePass runtime: {e}"))?;
     if status.success() { Ok(()) }
     else { Err(format!("certified Secrets daemon exited: {status}")) }
 }

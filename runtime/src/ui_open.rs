@@ -67,7 +67,7 @@ fn module_root()->Result<PathBuf,String>{
     let m:Value=serde_json::from_slice(&fs::read(root.join("manifest.json")).map_err(|e|e.to_string())?)
         .map_err(|e|e.to_string())?;
     if m.get("name").and_then(Value::as_str)!=Some(MODULE)
-        ||m.get("version").and_then(Value::as_str)!=Some("1.0.0")
+        ||m.get("version").and_then(Value::as_str)!=Some("1.0.1")
         ||m.get("entrypoint").and_then(Value::as_str)!=Some("runtime/neebles-secrets-ui") {
         return Err("installed Secrets identity mismatch".into());
     }
