@@ -236,6 +236,27 @@ impl VaultController {
         }
         Ok(provisioned)
     }
+    fn with_module_vault<F>(&self,module:&str,action:F)->Result<Value,String>
+    where F:FnOnce(&Path,&[u8])->Result<Value,String>{
+        if !valid_module(module){return Err("invalid_module_id".into());}
+        let master=self.unlocked.as_ref().ok_or("vault_locked")?;
+        if !self.initialized()?{return Err("setup_required".into());}
+        let path=self.directory.join(format!("vault-{module}.kdbx"));
+        if !validate_vault(&path)?{return Err("module_vault_missing".into());}
+        action(&path,master.as_bytes())
+    }
+    pub fn secret_list(&self,module:&str)->Result<Value,String>{
+        self.with_module_vault(module,crate::vault_records::list)
+    }
+    pub fn secret_get(&self,module:&str,id:&str)->Result<Value,String>{
+        self.with_module_vault(module,|p,k|crate::vault_records::get(p,k,id))
+    }
+    pub fn secret_put(&self,module:&str,id:&str,value:&Value,update_only:bool)->Result<Value,String>{
+        self.with_module_vault(module,|p,k|crate::vault_records::put(p,k,id,value,update_only))
+    }
+    pub fn secret_delete(&self,module:&str,id:&str)->Result<Value,String>{
+        self.with_module_vault(module,|p,k|crate::vault_records::delete(p,k,id))
+    }
     pub fn ensure(&mut self,module:&str)->Result<Value,String>{
         if !valid_module(module) {return Err("invalid_module_id".into());}
         let master=self.unlocked.as_ref().ok_or("vault_locked")?;

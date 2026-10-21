@@ -1,13 +1,16 @@
 //! NEEBLES Secrets F10: session-local Quick generator and locked vault boundary.
 //! No vault is opened, decrypted or written in F10. Never log generated secrets.
 mod vault;
+mod vault_records;
 mod boss_publisher;
 use vault::VaultController;
 use std::sync::{Arc, Mutex};
 use serde_json::{json, Value};
 use std::fs::{self, File};
+use std::ffi::OsStr;
 use std::io::{Read, Write};
 use std::os::unix::fs::{FileTypeExt, MetadataExt, PermissionsExt};
+use std::os::fd::AsRawFd;
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
 use std::process::{Command, ExitCode};
@@ -137,7 +140,65 @@ fn generate(input: &Value) -> Result<Value, String> {
     };
     Ok(json!({"kind":kind,"value":result,"stored":false}))
 }
-fn handle(input: &Value, state: &Arc<Mutex<VaultController>>) -> Value {
+// Secrets 1.0.2: never authorize secret retrieval by a client-supplied module
+// string. Resolve the local peer's kernel identity and its installed executable.
+// Only canonical, root-owned module binaries are accepted as secret clients.
+// The system's same-UID user can still control their own files/processes;
+// this is an installed-module provenance check, not a cross-UID sandbox.
+#[repr(C)]
+struct Ucred { pid:i32, uid:u32, gid:u32 }
+unsafe extern "C" {
+    fn getsockopt(fd:i32, level:i32, optname:i32, value:*mut std::ffi::c_void, len:*mut u32)->i32;
+}
+fn peer_module(stream:&UnixStream)->Result<String,String>{
+    let mut cred=Ucred{pid:0,uid:0,gid:0};
+    let mut len=std::mem::size_of::<Ucred>() as u32;
+    // Linux SOL_SOCKET=1, SO_PEERCRED=17.
+    let rc=unsafe{getsockopt(stream.as_raw_fd(),1,17,
+        (&mut cred as *mut Ucred).cast(),&mut len)};
+    if rc!=0 || len as usize!=std::mem::size_of::<Ucred>() || cred.pid<=0 || cred.uid!=uid(){
+        return Err("unauthenticated_secret_peer".into());
+    }
+    let exe=fs::read_link(format!("/proc/{}/exe",cred.pid))
+        .map_err(|_|"secret_peer_executable_unavailable")?;
+    let root=Path::new("/opt/neebles/modules");
+    let relative=exe.strip_prefix(root).map_err(|_|"secret_peer_outside_modules")?;
+    let parts=relative.components().collect::<Vec<_>>();
+    if parts.len()!=3 {return Err("invalid_secret_peer_executable".into());}
+    let name=parts[0].as_os_str().to_str().ok_or("invalid_secret_peer_executable")?;
+    let group=parts[1].as_os_str();
+    let binary=parts[2].as_os_str().to_str().ok_or("invalid_secret_peer_executable")?;
+    if name.is_empty() || name=="neebles-secrets" || name=="general" || name.len()>64
+       || !name.as_bytes()[0].is_ascii_lowercase()
+       || !name.bytes().all(|b|b.is_ascii_lowercase()||b.is_ascii_digit()||b==b'-')
+       || name.ends_with('-')||name.contains("--"){
+        return Err("invalid_secret_peer_module".into());
+    }
+    let is_runtime=group==OsStr::new("runtime") && binary==name;
+    let is_desktop=group==OsStr::new("bin") && binary==format!("{name}-desktop");
+    if !is_runtime && !is_desktop{return Err("unexpected_secret_peer_binary".into());}
+    let meta=fs::symlink_metadata(&exe).map_err(|_|"secret_peer_binary_unavailable")?;
+    if !meta.is_file() || meta.file_type().is_symlink() || meta.uid()!=0
+       || meta.permissions().mode()&0o022!=0 || meta.permissions().mode()&0o111==0{
+        return Err("untrusted_secret_peer_binary".into());
+    }
+    let manifest=root.join(name).join("manifest.json");
+    let meta=fs::symlink_metadata(&manifest).map_err(|_|"secret_peer_module_not_installed")?;
+    if !meta.is_file() || meta.file_type().is_symlink() || meta.uid()!=0 || meta.permissions().mode()&0o022!=0 {
+        return Err("untrusted_secret_peer_manifest".into());
+    }
+    let data:Value=serde_json::from_slice(&fs::read(&manifest).map_err(|_|"secret_peer_manifest_unavailable")?)
+        .map_err(|_|"invalid_secret_peer_manifest")?;
+    if data.get("schema").and_then(Value::as_u64)!=Some(4)
+       || data.get("name").and_then(Value::as_str)!=Some(name) {
+        return Err("invalid_secret_peer_module_identity".into());
+    }
+    Ok(name.to_owned())
+}
+fn is_sensitive_operation(op:&str)->bool {
+    matches!(op,"vault.list"|"secret.list"|"secret.put"|"secret.get"|"secret.update"|"secret.delete")
+}
+fn handle(input: &Value, peer:Option<&str>, state: &Arc<Mutex<VaultController>>) -> Value {
     let op=input.get("op").and_then(Value::as_str).unwrap_or("");
     let result:Result<Value,String>=match op {
         "quick.generate"=>generate(input),
@@ -156,7 +217,28 @@ fn handle(input: &Value, state: &Arc<Mutex<VaultController>>) -> Value {
                 Err(_)=>Err("vault_state_unavailable".into()),
             }
         },
-        "vault.list"|"secret.put"|"secret.get"|"secret.update"|"secret.delete"=>Err("operation_not_implemented".into()),
+        "vault.list"|"secret.list"|"secret.put"|"secret.get"|"secret.update"|"secret.delete" => {
+            let module=input.get("module").and_then(Value::as_str).unwrap_or("");
+            if peer != Some(module) {Err("secret_module_identity_mismatch".into())}
+            else {
+                match state.lock() {
+                    Ok(controller)=>match op {
+                        "vault.list"|"secret.list"=>controller.secret_list(module),
+                        "secret.get"=>controller.secret_get(module,input.get("id").and_then(Value::as_str).unwrap_or("")),
+                        "secret.put"|"secret.update"=>{
+                            let id=input.get("id").and_then(Value::as_str).unwrap_or("");
+                            match input.get("value") {
+                                Some(value)=>controller.secret_put(module,id,value,op=="secret.update"),
+                                None=>Err("missing_secret_value".into())
+                            }
+                        },
+                        "secret.delete"=>controller.secret_delete(module,input.get("id").and_then(Value::as_str).unwrap_or("")),
+                        _=>Err("unknown_operation".into()),
+                    },
+                    Err(_)=>Err("vault_state_unavailable".into()),
+                }
+            }
+        },
         _=>Err("unknown_operation".into()),
     };
     match result { Ok(data)=>json!({"ok":true,"data":data}),Err(error)=>json!({"ok":false,"error":error}) }
@@ -186,7 +268,9 @@ fn serve_one(mut stream: UnixStream, state: Arc<Mutex<VaultController>>) -> Resu
     stream.set_read_timeout(Some(Duration::from_secs(45))).map_err(|e|e.to_string())?;
     stream.set_write_timeout(Some(Duration::from_secs(45))).map_err(|e|e.to_string())?;
     let request=rpc_read(&mut stream)?;
-    let response=handle(&request,&state);
+    let op=request.get("op").and_then(Value::as_str).unwrap_or("");
+    let peer=if is_sensitive_operation(op) {Some(peer_module(&stream)?)} else {None};
+    let response=handle(&request,peer.as_deref(),&state);
     rpc_write(&mut stream,&response)
 }
 fn serve() -> Result<(),String> {
@@ -354,6 +438,7 @@ fn main()->ExitCode {
 mod tests {
     use super::*;
     #[test] fn frame_roundtrip(){let mut data=Vec::new();rpc_write(&mut data,&json!({"op":"status"})).unwrap(); assert_eq!(rpc_read(&mut data.as_slice()).unwrap()["op"],"status");}
+    #[test] fn sensitive_ops_are_separated(){assert!(is_sensitive_operation("secret.get"));assert!(is_sensitive_operation("vault.list"));assert!(!is_sensitive_operation("quick.generate"));}
     #[test] fn rejected_unknown_operation(){assert_eq!(json!({"ok":false})["ok"],false);}
     #[test] fn quick_password_all_groups(){let v=generate(&json!({"kind":"password","length":64,"lowercase":true,"uppercase":true,"numbers":true,"symbols":true})).unwrap();let s=v["value"].as_str().unwrap();assert_eq!(s.len(),64);assert!(s.bytes().any(|c|c.is_ascii_lowercase()));assert!(s.bytes().any(|c|c.is_ascii_uppercase()));assert!(s.bytes().any(|c|c.is_ascii_digit()));assert!(s.bytes().any(|c|!c.is_ascii_alphanumeric()));}
     #[test] fn quick_validation(){assert!(generate(&json!({"kind":"password","length":4})).is_err()); assert!(generate(&json!({"kind":"password","lowercase":false,"uppercase":false,"numbers":false,"symbols":false})).is_err()); assert!(generate(&json!({"kind":"ed25519"})).is_err());}

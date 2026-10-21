@@ -1,7 +1,7 @@
 {
   "schema": 4,
   "name": "neebles-secrets",
-  "version": "1.0.1",
+  "version": "1.0.2",
   "entrypoint": "runtime/neebles-secrets-ui",
   "lifecycle": "lifecycle.json",
   "surfaces": "surfaces.json",

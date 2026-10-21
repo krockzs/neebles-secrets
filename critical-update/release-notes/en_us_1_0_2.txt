@@ -1,0 +1,7 @@
+NEEBLES Secrets 1.0.2
+
+Adds encrypted module-owned record operations inside each module KDBX vault for Connect. Reading, creating, editing, deleting and listing records require a valid installed-module identity and an unlocked Secrets session.
+
+The update does NOT reset or remove the Master Key, vault-general or existing vaults.
+
+Save your work before restarting to apply this update.

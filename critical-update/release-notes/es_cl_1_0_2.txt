@@ -1,0 +1,7 @@
+NEEBLES Secrets 1.0.2
+
+Incorporamos almacenamiento cifrado de registros por módulo dentro de sus propias bóvedas KDBX para la integración con Connect. Las operaciones de lectura, creación, edición, eliminación y listado requieren la identidad del módulo solicitante y que Secrets esté desbloqueado.
+
+La actualización NO reinicializa ni elimina la Master Key, vault-general ni las bóvedas existentes.
+
+Guarde su trabajo antes de reiniciar para aplicar esta actualización.
