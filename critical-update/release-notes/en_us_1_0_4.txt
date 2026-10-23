@@ -1,0 +1,5 @@
+NEEBLES Secrets 1.0.4
+
+Fixed distribution: includes rebuilt Rust daemon, Rust UI launcher and full Qt desktop with the new Secrets functionality. The launcher now accepts the installed 1.0.4 manifest. Preserves your Master Key, encrypted vaults and module dependencies.
+
+Save your work before installing this update. You may need to unlock Secrets again afterward.

@@ -1,0 +1,5 @@
+NEEBLES Secrets 1.0.4
+
+Distribución corregida: incluye daemon Rust, lanzador Rust y escritorio Qt recompilados con todas las funcionalidades nuevas de Secrets. El lanzador reconoce el manifiesto 1.0.4 instalado. Conserva la Master Key, las bóvedas cifradas y las dependencias de los módulos.
+
+Guarda tu trabajo antes de actualizar. Es posible que debas desbloquear Secrets nuevamente.
