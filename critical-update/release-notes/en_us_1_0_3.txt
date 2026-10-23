@@ -1,0 +1,9 @@
+NEEBLES Secrets 1.0.3
+
+What's new: My Secrets, Quick and Batch Generators, SHA-3/scrypt Cryptographic Lab, transactional Backup & Restore, portable encrypted KDBX export with an independent password, and strengthened Connect IPC permissions.
+
+Secrets continues storing credentials in encrypted KDBX vaults. Your existing Master Key and vault files are retained. No new Boss Feature is declared; Launcher and Tray remain available.
+
+The upgrade may leave Secrets locked: unlock it with the existing Master Key. Do not edit or restore any vaults while upgrade integrity is being checked.
+
+Save your work before any reboot requested by Boss.

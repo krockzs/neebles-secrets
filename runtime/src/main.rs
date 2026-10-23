@@ -1,8 +1,16 @@
-//! NEEBLES Secrets F10: session-local Quick generator and locked vault boundary.
+//! NEEBLES Secrets 1.0.3: brokered IPC, personal KDBX and isolated crypto lab.
 //! No vault is opened, decrypted or written in F10. Never log generated secrets.
 mod vault;
 mod vault_records;
+mod backup_sessions;
+mod restore_sessions;
+#[allow(dead_code)]
+mod restore_transaction;
+mod ipc_bridge;
 mod boss_publisher;
+mod crypto_lab;
+mod batch_generator;
+mod portable_exports;
 use vault::VaultController;
 use std::sync::{Arc, Mutex};
 use serde_json::{json, Value};
@@ -11,14 +19,16 @@ use std::ffi::OsStr;
 use std::io::{Read, Write};
 use std::os::unix::fs::{FileTypeExt, MetadataExt, PermissionsExt};
 use std::os::fd::AsRawFd;
-use std::os::unix::net::{UnixListener, UnixStream};
+use std::os::unix::net::{UnixDatagram, UnixListener, UnixStream};
+use std::os::fd::{FromRawFd, OwnedFd};
+use std::process::Stdio;
 use std::path::{Path, PathBuf};
 use std::process::{Command, ExitCode};
 use std::time::Duration;
 
 const MAX_FRAME: usize = 16 * 1024;
-const MAX_PASSWORD: usize = 128;
-const MAX_RANDOM_BYTES: usize = 128;
+const MAX_PASSWORD: usize = 512;
+const MAX_RANDOM_BYTES: usize = 512;
 
 #[cfg(target_os = "linux")]
 unsafe extern "C" { fn geteuid() -> u32; }
@@ -53,12 +63,14 @@ fn crypto_bytes(count: usize) -> Result<Vec<u8>, String> {
     Ok(bytes)
 }
 fn pick_index(size: usize) -> Result<usize, String> {
-    if size == 0 || size > 256 { return Err("invalid character set".into()); }
-    // Rejection sampling: avoid modulo bias when alphabet size is not a divisor of 256.
-    let limit = 256 - 256 % size;
+    if size == 0 || size > 4096 { return Err("invalid character set".into()); }
+    // Uniform rejection sampling also supports password shuffles > 256 bytes.
+    let span = 1u64 << 32;
+    let limit = span - (span % size as u64);
     loop {
-        let b = crypto_bytes(1)?[0] as usize;
-        if b < limit { return Ok(b % size); }
+        let data=crypto_bytes(4)?;
+        let value=u32::from_le_bytes([data[0],data[1],data[2],data[3]]) as u64;
+        if value < limit { return Ok((value % size as u64) as usize); }
     }
 }
 fn char_without_ambiguity(character: u8) -> bool {
@@ -66,7 +78,7 @@ fn char_without_ambiguity(character: u8) -> bool {
 }
 fn password(input: &Value) -> Result<String, String> {
     let length = input.get("length").and_then(Value::as_u64).unwrap_or(24) as usize;
-    if !(8..=MAX_PASSWORD).contains(&length) { return Err("password length must be 8..128".into()); }
+    if !(8..=MAX_PASSWORD).contains(&length) { return Err("password length must be 8..512".into()); }
     let groups = [
         ("lowercase", b"abcdefghijklmnopqrstuvwxyz".as_slice()),
         ("uppercase", b"ABCDEFGHIJKLMNOPQRSTUVWXYZ".as_slice()),
@@ -129,11 +141,16 @@ fn generate(input: &Value) -> Result<Value, String> {
     let kind=input.get("kind").and_then(Value::as_str).unwrap_or("password");
     let result=match kind {
         "password" => password(input)?,
-        "hex" | "base64url" => {
+        "hex" | "base64url" | "base64" | "salt" | "pepper" | "key" => {
             let count = input.get("length").and_then(Value::as_u64).unwrap_or(32) as usize;
-            if !(16..=MAX_RANDOM_BYTES).contains(&count) { return Err("random byte count must be 16..128".into()); }
+            if !(16..=MAX_RANDOM_BYTES).contains(&count) { return Err("random byte count must be 16..512".into()); }
             let bytes=crypto_bytes(count)?;
-            if kind=="hex" {hex(&bytes)} else {base64url(&bytes)}
+            match kind {
+                "hex" | "salt" | "pepper" | "key" => hex(&bytes),
+                "base64url" => base64url(&bytes),
+                "base64" => base64::Engine::encode(&base64::engine::general_purpose::STANDARD, &bytes),
+                _ => unreachable!(),
+            }
         },
         "uuid" => uuid_v4()?,
         _ => return Err("unsupported quick generator".into()),
@@ -168,7 +185,7 @@ fn peer_module(stream:&UnixStream)->Result<String,String>{
     let name=parts[0].as_os_str().to_str().ok_or("invalid_secret_peer_executable")?;
     let group=parts[1].as_os_str();
     let binary=parts[2].as_os_str().to_str().ok_or("invalid_secret_peer_executable")?;
-    if name.is_empty() || name=="neebles-secrets" || name=="general" || name.len()>64
+    if name.is_empty() || name=="general" || name.len()>64
        || !name.as_bytes()[0].is_ascii_lowercase()
        || !name.bytes().all(|b|b.is_ascii_lowercase()||b.is_ascii_digit()||b==b'-')
        || name.ends_with('-')||name.contains("--"){
@@ -176,7 +193,13 @@ fn peer_module(stream:&UnixStream)->Result<String,String>{
     }
     let is_runtime=group==OsStr::new("runtime") && binary==name;
     let is_desktop=group==OsStr::new("bin") && binary==format!("{name}-desktop");
-    if !is_runtime && !is_desktop{return Err("unexpected_secret_peer_binary".into());}
+    // The Secrets Qt desktop is a first-party self-client. Only that installed
+    // ELF may address vault-general; Secrets' runtime must not gain UI authority.
+    if name == "neebles-secrets" {
+        if !is_desktop {return Err("invalid_secrets_personal_client".into());}
+    } else if !is_runtime && !is_desktop {
+        return Err("unexpected_secret_peer_binary".into());
+    }
     let meta=fs::symlink_metadata(&exe).map_err(|_|"secret_peer_binary_unavailable")?;
     if !meta.is_file() || meta.file_type().is_symlink() || meta.uid()!=0
        || meta.permissions().mode()&0o022!=0 || meta.permissions().mode()&0o111==0{
@@ -195,26 +218,180 @@ fn peer_module(stream:&UnixStream)->Result<String,String>{
     }
     Ok(name.to_owned())
 }
+fn authorized_personal_peer(peer: Option<&str>) -> bool {
+    // This value is assigned exclusively by the external SO_PEERCRED broker;
+    // incoming JSON cannot claim it. The broker verifies the root-owned Qt ELF.
+    peer == Some("neebles-secrets")
+}
+// F15: operation-level authorization. The broker verifies executable provenance
+// via SO_PEERCRED and carries peer identity over the private SCM_RIGHTS channel.
+// A request's JSON "module" field is never an authentication credential.
+fn authorize_vault_operation(
+    op: &str,
+    peer: Option<&str>,
+    requested_module: Option<&str>,
+) -> Result<(), &'static str> {
+    match op {
+        // Flags only; Boss publisher and diagnostics do not need module authority.
+        "status" | "vault.status" => Ok(()),
+        // Setup, unlocking and locking belong to the installed Secrets desktop.
+        "vault.setup" | "vault.unlock" | "vault.lock" => {
+            if authorized_personal_peer(peer) { Ok(()) }
+            else { Err("vault_control_forbidden") }
+        },
+        // A consumer can query/create/request only ITS OWN namespaced KDBX.
+        // Secrets' desktop is not a consumer and must not impersonate another module.
+        "vault.exists" | "vault.ensure" | "vault.request" => {
+            match (peer, requested_module) {
+                (Some(caller), Some(target))
+                    if caller == target && caller != "neebles-secrets" => Ok(()),
+                _ => Err("vault_module_identity_mismatch"),
+            }
+        },
+        _ => Err("unknown_operation"),
+    }
+}
+
+// This classification is a defense-in-depth inventory used by regression
+// checks. Per-operation authorization is enforced in handle(), not here.
 fn is_sensitive_operation(op:&str)->bool {
-    matches!(op,"vault.list"|"secret.list"|"secret.put"|"secret.get"|"secret.update"|"secret.delete")
+    matches!(op,"vault.setup"|"vault.unlock"|"vault.lock"|"vault.exists"|"vault.ensure"|"vault.request"
+        |"vault.list"|"secret.list"|"secret.put"|"secret.get"|"secret.update"|"secret.delete"
+        |"general.list"|"general.get"|"general.put"|"general.update"|"general.delete"|"crypto.compute"|"batch.generate"
+        |"backup.catalog"|"backup.open"|"backup.read"|"backup.close"
+        |"portable.begin"|"portable.append"|"portable.seal"|"portable.read"|"portable.close"
+        |"restore.start"|"restore.chunk"|"restore.validate"|"restore.abort"|"restore.queue"|"restore.plan"|"restore.discard"|"restore.commit")
 }
 fn handle(input: &Value, peer:Option<&str>, state: &Arc<Mutex<VaultController>>) -> Value {
     let op=input.get("op").and_then(Value::as_str).unwrap_or("");
     let result:Result<Value,String>=match op {
         "quick.generate"=>generate(input),
+        "crypto.compute" => {
+            if !authorized_personal_peer(peer) {Err("crypto_lab_forbidden".into())}
+            else {crypto_lab::compute(input)}
+        },
+        "batch.generate" => {
+            // Batch output is ephemeral and restricted to Secrets' own Qt UI.
+            // Every response fits the existing 16 KiB IPC frame.
+            if !authorized_personal_peer(peer) {Err("batch_generator_forbidden".into())}
+            else {batch_generator::generate_batch(input)}
+        },
         "status"|"vault.status"|"vault.setup"|"vault.unlock"|"vault.lock"|"vault.exists"|"vault.ensure"|"vault.request" => {
-            match state.lock() {
-                Ok(mut controller)=>match op {
-                    "status"|"vault.status"=>controller.status(),
-                    "vault.setup"=>controller.setup(input.get("password").and_then(Value::as_str).unwrap_or("")),
-                    "vault.unlock"=>controller.unlock(input.get("password").and_then(Value::as_str).unwrap_or("")),
-                    "vault.lock"=>Ok(controller.lock()),
-                    "vault.exists"=>controller.exists(input.get("module").and_then(Value::as_str).unwrap_or("")),
-                    "vault.ensure"=>controller.ensure(input.get("module").and_then(Value::as_str).unwrap_or("")),
-                    "vault.request"=>controller.request(input.get("module").and_then(Value::as_str).unwrap_or("")),
-                    _=>Err("unknown_operation".into()),
+            // Fail closed BEFORE locking VaultController or running any mutation.
+            // In particular an anonymous local socket caller cannot lock the UI,
+            // select an initial Master Key or provision another module's vault.
+            match authorize_vault_operation(op, peer, input.get("module").and_then(Value::as_str)) {
+                Err(error) => Err(error.into()),
+                Ok(()) => match state.lock() {
+                    Ok(mut controller)=>match op {
+                        "status"|"vault.status"=>controller.status(),
+                        "vault.setup"=>controller.setup(input.get("password").and_then(Value::as_str).unwrap_or("")),
+                        "vault.unlock"=>controller.unlock(input.get("password").and_then(Value::as_str).unwrap_or("")),
+                        "vault.lock"=>Ok(controller.lock()),
+                        "vault.exists"=>controller.exists(input.get("module").and_then(Value::as_str).unwrap_or("")),
+                        "vault.ensure"=>controller.ensure(input.get("module").and_then(Value::as_str).unwrap_or("")),
+                        "vault.request"=>controller.request(input.get("module").and_then(Value::as_str).unwrap_or("")),
+                        _=>Err("unknown_operation".into()),
+                    },
+                    Err(_)=>Err("vault_state_unavailable".into()),
                 },
-                Err(_)=>Err("vault_state_unavailable".into()),
+            }
+        },
+        "portable.begin"|"portable.append"|"portable.seal"|"portable.read"|"portable.close" => {
+            if !authorized_personal_peer(peer){Err("portable_export_forbidden".into())}
+            else {
+                match state.lock(){
+                    Ok(mut controller)=>match op {
+                        "portable.begin"=>controller.portable_begin(input.get("passphrase").and_then(Value::as_str).unwrap_or("")),
+                        "portable.append"=>controller.portable_append(input.get("token").and_then(Value::as_str).unwrap_or(""),input.get("value").and_then(Value::as_str).unwrap_or("")),
+                        "portable.seal"=>controller.portable_seal(input.get("token").and_then(Value::as_str).unwrap_or("")),
+                        "portable.read"=>{
+                            let offset=input.get("offset").and_then(Value::as_u64).unwrap_or(u64::MAX);
+                            let count=input.get("count").and_then(Value::as_u64).unwrap_or(u64::MAX);
+                            if count>6144 || offset==u64::MAX{Err("portable_chunk_invalid".into())}
+                            else {controller.portable_read(input.get("token").and_then(Value::as_str).unwrap_or(""),offset,count as usize)}
+                        },
+                        "portable.close"=>controller.portable_close(input.get("token").and_then(Value::as_str).unwrap_or("")),
+                        _=>Err("unknown_operation".into()),
+                    },
+                    Err(_)=>Err("vault_state_unavailable".into()),
+                }
+            }
+        },
+        "backup.catalog"|"backup.open"|"backup.read"|"backup.close" => {
+            // Only the root-owned installed Secrets desktop can stream encrypted
+            // KDBX bytes. A consumer can never list or export another vault.
+            if !authorized_personal_peer(peer) {Err("backup_forbidden".into())}
+            else {
+                match state.lock(){
+                    Ok(mut controller)=>match op {
+                        "backup.catalog"=>controller.backup_catalog(),
+                        "backup.open"=>controller.backup_open(
+                            input.get("mode").and_then(Value::as_str).unwrap_or(""),
+                            input.get("name").and_then(Value::as_str)),
+                        "backup.read"=>{
+                            let token=input.get("token").and_then(Value::as_str).unwrap_or("");
+                            let index=input.get("index").and_then(Value::as_u64).unwrap_or(u64::MAX);
+                            let offset=input.get("offset").and_then(Value::as_u64).unwrap_or(u64::MAX);
+                            let count=input.get("count").and_then(Value::as_u64).unwrap_or(u64::MAX);
+                            if index>64 || count>6144 {Err("backup_chunk_invalid".into())}
+                            else {controller.backup_read(token,index as usize,offset,count as usize)}
+                        },
+                        "backup.close"=>controller.backup_close(input.get("token").and_then(Value::as_str).unwrap_or("")),
+                        _=>Err("unknown_operation".into()),
+                    },
+                    Err(_)=>Err("vault_state_unavailable".into()),
+                }
+            }
+        },
+        "restore.start"|"restore.chunk"|"restore.validate"|"restore.abort"|"restore.queue"|"restore.plan"|"restore.discard"|"restore.commit" => {
+            if !authorized_personal_peer(peer){Err("restore_forbidden".into())}
+            else {
+                match state.lock(){
+                    Ok(mut controller)=>match op {
+                        "restore.start"=>controller.restore_start(
+                            input.get("target").and_then(Value::as_str).unwrap_or(""),
+                            input.get("size").and_then(Value::as_u64).unwrap_or(0),
+                            input.get("sha256").and_then(Value::as_str).unwrap_or("")),
+                        "restore.chunk"=>controller.restore_chunk(
+                            input.get("token").and_then(Value::as_str).unwrap_or(""),
+                            input.get("offset").and_then(Value::as_u64).unwrap_or(u64::MAX),
+                            input.get("value").and_then(Value::as_str).unwrap_or("")),
+                        "restore.validate"=>controller.restore_validate(input.get("token").and_then(Value::as_str).unwrap_or("")),
+                        "restore.abort"=>controller.restore_abort(input.get("token").and_then(Value::as_str).unwrap_or("")),
+                        "restore.queue"=>controller.restore_queue(input.get("token").and_then(Value::as_str).unwrap_or("")),
+                        "restore.plan"=>controller.restore_plan(),
+                        "restore.discard"=>controller.restore_discard(),
+                        "restore.commit"=>controller.restore_commit(
+                            input.get("confirmation").and_then(Value::as_str).unwrap_or("")),
+                        _=>Err("unknown_operation".into())
+                    },
+                    Err(_)=>Err("vault_state_unavailable".into()),
+                }
+            }
+        },
+        // Personal Secrets uses a separate operation family. module=general is
+        // never a consumer-controlled escape hatch into the general vault.
+        "general.list"|"general.get"|"general.put"|"general.update"|"general.delete" => {
+            if !authorized_personal_peer(peer) {
+                Err("personal_vault_forbidden".into())
+            } else {
+                match state.lock() {
+                    Ok(controller) => match op {
+                        "general.list" => controller.general_list(),
+                        "general.get" => controller.general_get(input.get("id").and_then(Value::as_str).unwrap_or("")),
+                        "general.put"|"general.update" => {
+                            let id=input.get("id").and_then(Value::as_str).unwrap_or("");
+                            match input.get("value") {
+                                Some(value) => controller.general_put(id,value,op=="general.update"),
+                                None => Err("missing_secret_value".into()),
+                            }
+                        },
+                        "general.delete" => controller.general_delete(input.get("id").and_then(Value::as_str).unwrap_or("")),
+                        _ => Err("unknown_operation".into()),
+                    },
+                    Err(_) => Err("vault_state_unavailable".into()),
+                }
             }
         },
         "vault.list"|"secret.list"|"secret.put"|"secret.get"|"secret.update"|"secret.delete" => {
@@ -264,16 +441,36 @@ fn validate_private_dir(path: &Path) -> Result<(),String> {
     }
     Ok(())
 }
-fn serve_one(mut stream: UnixStream, state: Arc<Mutex<VaultController>>) -> Result<(),String> {
+fn serve_authorized_one(
+    mut stream: UnixStream,
+    peer: Option<String>,
+    state: Arc<Mutex<VaultController>>,
+) -> Result<(), String> {
     stream.set_read_timeout(Some(Duration::from_secs(45))).map_err(|e|e.to_string())?;
     stream.set_write_timeout(Some(Duration::from_secs(45))).map_err(|e|e.to_string())?;
     let request=rpc_read(&mut stream)?;
-    let op=request.get("op").and_then(Value::as_str).unwrap_or("");
-    let peer=if is_sensitive_operation(op) {Some(peer_module(&stream)?)} else {None};
+    // Identity always comes from the external broker's SO_PEERCRED verification,
+    // carried over a private inherited datagram channel, never from JSON.
     let response=handle(&request,peer.as_deref(),&state);
     rpc_write(&mut stream,&response)
 }
-fn serve() -> Result<(),String> {
+fn serve_in_isolated_world() -> Result<(), String> {
+    // F04: stdin is the inherited anonymous control socket. The KeePass worker
+    // no longer binds a filesystem socket or reads untrusted /proc/<PID>/exe.
+    let control = unsafe { UnixDatagram::from_raw_fd(0) };
+    let state=Arc::new(Mutex::new(VaultController::new()?));
+    eprintln!("NEEBLES Secrets: isolated KeePass worker running");
+    loop {
+        let (client, peer)=ipc_bridge::recv_connection(&control)?;
+        let shared=Arc::clone(&state);
+        std::thread::spawn(move || {
+            if let Err(error)=serve_authorized_one(client,peer,shared) {
+                eprintln!("Secrets IPC transport: {error}");
+            }
+        });
+    }
+}
+fn bind_broker_listener() -> Result<(UnixListener, PathBuf), String> {
     let path=socket_path()?;
     let dir=path.parent().ok_or("socket parent missing")?;
     if !dir.exists() {
@@ -282,22 +479,43 @@ fn serve() -> Result<(),String> {
     }
     validate_private_dir(dir)?;
     if path.exists() {
-        if UnixStream::connect(&path).is_ok() { return Err("Secrets service already running".into()); }
+        if UnixStream::connect(&path).is_ok() {return Err("Secrets service already running".into());}
         let m=fs::symlink_metadata(&path).map_err(|e|e.to_string())?;
-        if !m.file_type().is_socket() || m.uid()!=uid() { return Err("unsafe stale socket".into()); }
+        if !m.file_type().is_socket() || m.uid()!=uid() {return Err("unsafe stale socket".into());}
         fs::remove_file(&path).map_err(|e|format!("stale socket: {e}"))?;
     }
-    let state=Arc::new(Mutex::new(VaultController::new()?));
     let listener=UnixListener::bind(&path).map_err(|e|format!("bind: {e}"))?;
     fs::set_permissions(&path,fs::Permissions::from_mode(0o600)).map_err(|e|format!("chmod: {e}"))?;
-    eprintln!("NEEBLES Secrets F14: user session service available");
-    for client in listener.incoming() {
-        match client {
-            Ok(stream) => { let shared=Arc::clone(&state); std::thread::spawn(move || { if let Err(e)=serve_one(stream,shared) { eprintln!("Secrets IPC transport: {e}"); } }); },
-            Err(e) => eprintln!("Secrets socket accept: {e}"),
+    listener.set_nonblocking(true).map_err(|e|e.to_string())?;
+    Ok((listener,path))
+}
+fn broker_loop(
+    listener: &UnixListener,
+    child: &mut std::process::Child,
+    control: &UnixDatagram,
+) -> Result<std::process::ExitStatus,String> {
+    control.set_write_timeout(Some(Duration::from_secs(3))).map_err(|e|e.to_string())?;
+    loop {
+        if let Some(status) = child.try_wait().map_err(|e|format!("isolated worker wait: {e}"))? {
+            return Ok(status);
+        }
+        match listener.accept() {
+            Ok((client,_)) => {
+                // Host's user/mount namespaces can inspect both /proc/<pid>/exe
+                // and root-owned installed manifests. Invalid peers carry None:
+                // the isolated handle() denies every sensitive operation.
+                let peer=peer_module(&client).ok();
+                if let Err(error)=ipc_bridge::send_connection(control,&client,peer.as_deref()) {
+                    eprintln!("Secrets private FD transport: {error}");
+                }
+            },
+            Err(error) if error.kind()==std::io::ErrorKind::WouldBlock => {
+                std::thread::sleep(Duration::from_millis(75));
+            },
+            Err(error) if error.kind()==std::io::ErrorKind::Interrupted => {},
+            Err(error) => return Err(format!("Secrets broker accept: {error}")),
         }
     }
-    Ok(())
 }
 fn request(input: &Value) -> Result<Value,String> {
     let mut stream=UnixStream::connect(socket_path()?).map_err(|e|format!("Secrets service unavailable: {e}"))?;
@@ -305,13 +523,13 @@ fn request(input: &Value) -> Result<Value,String> {
     rpc_write(&mut stream,input)?;
     rpc_read(&mut stream)
 }
-// F30: systemd --user ExecStart stays module-owned and unchanged. The wrapper
-// re-enters the pinned installed KeePass rootfs before the socket is bound.
+// F04: systemd --user ExecStart stays unchanged. The host broker owns the
+// public socket and the separate child re-enters the certified KeePass world.
 // No KeePass package is installed in the host. No new master vault is made.
 fn serve_from_certified_world() -> Result<(), String> {
     if std::env::var_os("NEEBLES_SECRETS_INSIDE_WORLD").as_deref()
         == Some(std::ffi::OsStr::new("1")) {
-        return serve();
+        return serve_in_isolated_world();
     }
     if uid() == 0 {
         return Err("Secrets service must run as the desktop user, not root".into());
@@ -360,6 +578,14 @@ fn serve_from_certified_world() -> Result<(), String> {
         || data_meta.uid() != uid() || data_meta.permissions().mode() & 0o077 != 0 {
         return Err("Secrets data directory must be owned and private (0700)".into());
     }
+    // Broker stays outside bwrap and owns the only public secrets.sock.
+    // A private, anonymous SOCK_DGRAM pair passes approved client descriptors
+    // directly to the isolated worker via SCM_RIGHTS. No RPC content crosses
+    // broker userspace, no second filesystem socket and no Secrets data mount.
+    let (listener, broker_socket_path)=bind_broker_listener()?;
+    let (broker_control, isolated_control)=UnixDatagram::pair()
+        .map_err(|e|format!("private FD channel: {e}"))?;
+    let child_control:OwnedFd=isolated_control.into();
     let mut cmd = Command::new("/usr/bin/bwrap");
     cmd.arg("--die-with-parent")
         .arg("--clearenv")
@@ -394,10 +620,12 @@ fn serve_from_certified_world() -> Result<(), String> {
         .arg("--chdir").arg("/home/neebles")
         .arg(module.join("runtime/neebles-secrets"))
         .arg("--serve");
+    // Bubblewrap keeps stdin connected to the isolated command (F03 passed).
+    cmd.stdin(Stdio::from(child_control));
     // Remain the systemd main process until the daemon exits, so failures
     // reach Restart=on-failure. The internal daemon still owns the socket.
     // The systemd-owned outer process is the only Boss service publisher.
-    // The inner KeePass daemon stays in bwrap, with no Boss socket mounted.
+    // The inner KeePass worker stays in bwrap, with no Boss socket mounted.
     // The outer process reads only non-secret status flags through Secrets IPC.
     let publishing = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true));
     let publisher_flag = std::sync::Arc::clone(&publishing);
@@ -406,10 +634,18 @@ fn serve_from_certified_world() -> Result<(), String> {
         .spawn(move || boss_publisher::run(publisher_flag))
         .map_err(|e| format!("cannot create Boss publisher worker: {e}"))?;
 
-    let result = cmd.status();
+    let result = (|| {
+        let mut child=cmd.spawn().map_err(|e|format!("cannot enter certified KeePass runtime: {e}"))?;
+        let result=broker_loop(&listener,&mut child,&broker_control);
+        if result.is_err() { let _=child.kill(); let _=child.wait(); }
+        result
+    })();
     publishing.store(false, std::sync::atomic::Ordering::Release);
     let _ = publisher.join();
-    let status = result.map_err(|e|format!("cannot enter certified KeePass runtime: {e}"))?;
+    // This path is created by the host broker, never the KeePass worker.
+    drop(listener);
+    let _ = fs::remove_file(&broker_socket_path);
+    let status=result?;
     if status.success() { Ok(()) }
     else { Err(format!("certified Secrets daemon exited: {status}")) }
 }
@@ -438,10 +674,64 @@ fn main()->ExitCode {
 mod tests {
     use super::*;
     #[test] fn frame_roundtrip(){let mut data=Vec::new();rpc_write(&mut data,&json!({"op":"status"})).unwrap(); assert_eq!(rpc_read(&mut data.as_slice()).unwrap()["op"],"status");}
-    #[test] fn sensitive_ops_are_separated(){assert!(is_sensitive_operation("secret.get"));assert!(is_sensitive_operation("vault.list"));assert!(!is_sensitive_operation("quick.generate"));}
+    #[test] fn ipc_f15_master_key_and_lock_require_secrets_desktop() {
+        for operation in ["vault.setup", "vault.unlock", "vault.lock"] {
+            for identity in [None, Some("neebles-connect"), Some("neebles-db")] {
+                assert_eq!(authorize_vault_operation(operation, identity, None), Err("vault_control_forbidden"));
+            }
+            assert_eq!(authorize_vault_operation(operation, Some("neebles-secrets"), None), Ok(()));
+            assert!(is_sensitive_operation(operation));
+        }
+        // A forged JSON identity cannot create broker-assigned peer authority.
+        let forged = json!({"op":"vault.unlock", "peer":"neebles-secrets", "module":"neebles-secrets"});
+        assert_eq!(authorize_vault_operation(forged["op"].as_str().unwrap(), None,
+            forged["module"].as_str()), Err("vault_control_forbidden"));
+    }
+    #[test] fn ipc_f15_consumer_cannot_request_other_modules_vaults() {
+        for operation in ["vault.exists", "vault.ensure", "vault.request"] {
+            assert_eq!(authorize_vault_operation(operation, Some("neebles-connect"), Some("neebles-connect")), Ok(()));
+            assert_eq!(authorize_vault_operation(operation, Some("neebles-db"), Some("neebles-db")), Ok(()));
+            for identity in [None, Some("neebles-secrets"), Some("neebles-db")] {
+                assert_eq!(authorize_vault_operation(operation, identity, Some("neebles-connect")),
+                    Err("vault_module_identity_mismatch"));
+            }
+            assert_eq!(authorize_vault_operation(operation, Some("neebles-connect"), None),
+                Err("vault_module_identity_mismatch"));
+            assert!(is_sensitive_operation(operation));
+        }
+    }
+    #[test] fn ipc_f15_nonsecret_status_stays_available() {
+        for operation in ["status", "vault.status"] {
+            for identity in [None, Some("neebles-connect"), Some("neebles-secrets")] {
+                assert_eq!(authorize_vault_operation(operation, identity, None), Ok(()));
+            }
+        }
+        for operation in ["general.get", "secret.get", "restore.commit"] {
+            assert!(is_sensitive_operation(operation));
+        }
+    }
+    #[test] fn portable_export_requires_sensitive_peer(){assert!(is_sensitive_operation("portable.begin"));assert!(is_sensitive_operation("portable.read"));}
+    #[test] fn restore_commit_requires_sensitive_peer(){assert!(is_sensitive_operation("restore.commit"));}
+    #[test] fn sensitive_ops_are_separated(){assert!(is_sensitive_operation("crypto.compute"));assert!(is_sensitive_operation("batch.generate"));assert!(is_sensitive_operation("secret.get"));assert!(is_sensitive_operation("vault.list"));assert!(!is_sensitive_operation("quick.generate"));}
     #[test] fn rejected_unknown_operation(){assert_eq!(json!({"ok":false})["ok"],false);}
     #[test] fn quick_password_all_groups(){let v=generate(&json!({"kind":"password","length":64,"lowercase":true,"uppercase":true,"numbers":true,"symbols":true})).unwrap();let s=v["value"].as_str().unwrap();assert_eq!(s.len(),64);assert!(s.bytes().any(|c|c.is_ascii_lowercase()));assert!(s.bytes().any(|c|c.is_ascii_uppercase()));assert!(s.bytes().any(|c|c.is_ascii_digit()));assert!(s.bytes().any(|c|!c.is_ascii_alphanumeric()));}
     #[test] fn quick_validation(){assert!(generate(&json!({"kind":"password","length":4})).is_err()); assert!(generate(&json!({"kind":"password","lowercase":false,"uppercase":false,"numbers":false,"symbols":false})).is_err()); assert!(generate(&json!({"kind":"ed25519"})).is_err());}
+    #[test] fn quick_expanded_generator() {
+        assert_eq!(generate(&json!({"kind":"password","length":512})).unwrap()["value"].as_str().unwrap().len(),512);
+        assert_eq!(generate(&json!({"kind":"base64","length":16})).unwrap()["value"].as_str().unwrap().len(),24);
+        assert_eq!(generate(&json!({"kind":"salt","length":16})).unwrap()["value"].as_str().unwrap().len(),32);
+    }
     #[test] fn quick_uuid(){let s=uuid_v4().unwrap();assert_eq!(s.len(),36);assert_eq!(&s[14..15],"4");assert!(matches!(&s[19..20],"8"|"9"|"a"|"b"));}
+    #[test] fn personal_gate_is_separate_from_module_gate() {
+        assert!(authorized_personal_peer(Some("neebles-secrets")));
+        for who in [None,Some("general"),Some("neebles-connect"),Some("neebles-db")] {
+            assert!(!authorized_personal_peer(who));
+        }
+        for op in ["general.list","general.get","general.put","general.update","general.delete"] {
+            assert!(is_sensitive_operation(op));
+        }
+    }
     #[test] fn quick_token_lengths(){assert_eq!(generate(&json!({"kind":"hex","length":16})).unwrap()["value"].as_str().unwrap().len(),32); assert_eq!(generate(&json!({"kind":"base64url","length":16})).unwrap()["value"].as_str().unwrap().len(),22);}
 }
+#[cfg(test)]
+mod restore_real_kdbx_tests;

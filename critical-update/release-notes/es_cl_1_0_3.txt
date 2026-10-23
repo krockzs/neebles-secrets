@@ -1,0 +1,9 @@
+NEEBLES Secrets 1.0.3
+
+Novedades: My Secrets, Generador Rápido y por lotes, Laboratorio Criptográfico con SHA-3 y scrypt, Backup & Restore transaccional, exportación KDBX cifrada con contraseña independiente y permisos IPC reforzados para Connect.
+
+Secrets sigue guardando credenciales en bóvedas KDBX cifradas. Se mantienen la Master Key original y las bóvedas existentes. No se crea ninguna Feature nueva en Boss; Launcher y Tray permanecen disponibles.
+
+Tras actualizar, es posible que la sesión quede bloqueada: desbloquee Secrets con su Master Key actual. No cambie ni restaure las bóvedas mientras se verifica la actualización.
+
+Guarde su trabajo antes del reinicio que pueda solicitar Boss.

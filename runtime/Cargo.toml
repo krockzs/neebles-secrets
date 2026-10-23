@@ -1,6 +1,6 @@
 [package]
 name = "neebles-secrets-runtime"
-version = "1.0.2"
+version = "1.0.3"
 edition = "2021"
 
 [[bin]]
@@ -13,3 +13,16 @@ path = "src/ui_open.rs"
 
 [dependencies]
 serde_json = "=1.0.151"
+# Shared versions already present in NEEBLES Boss 2.0.6 Cargo.lock.
+# This is a separate binary: the source uses the same Rust crates, not Boss' private handlers.
+sha2 = "=0.11.0"
+blake2 = "=0.11.0"
+hmac = "=0.13.0"
+pbkdf2 = "=0.13.0"
+argon2 = "=0.6.0"
+base64 = "=0.23.1"
+# Constant-time comparison used by Cryptographic Lab verification (same Boss lock version).
+subtle = "=2.6.1"
+
+# File-descriptor O_NOFOLLOW verification for encrypted backup snapshots.
+libc = "=0.2.189"

@@ -1,6 +1,7 @@
 //! F14: vault-general is exclusively user-owned. A module requests its own vault.
 //! No implicit module-vault creation, no master password in module requests.
 use serde_json::{json, Value};
+use sha2::{Digest, Sha256};
 use std::collections::BTreeSet;
 use std::ffi::OsStr;
 use std::fs::{self, File, OpenOptions};
@@ -27,6 +28,9 @@ pub struct VaultController {
     directory: PathBuf,
     unlocked: Option<Master>,
     pending: BTreeSet<String>,
+    backups: crate::backup_sessions::BackupSessions,
+    restores: crate::restore_sessions::RestoreSessions,
+    portable: crate::portable_exports::PortableExports,
 }
 
 fn current_uid() -> u32 { unsafe extern "C" { fn geteuid() -> u32; } unsafe { geteuid() } }
@@ -152,7 +156,11 @@ impl VaultController {
                 .map_err(|_|"could not protect vault directory".to_string())?;
         }
         validate_private_dir(&folder)?;
-        Ok(Self {directory:folder,unlocked:None,pending:BTreeSet::new()})
+        // Recover an interrupted prepared transaction BEFORE accepting IPC or unlock.
+        // This reads only encrypted files and the recovery journal; it never needs
+        // the Master Key. Fail closed when rollback cannot be proven complete.
+        crate::restore_transaction::recover(&folder)?;
+        Ok(Self {directory:folder,unlocked:None,pending:BTreeSet::new(),backups:Default::default(),restores:Default::default(),portable:Default::default()})
     }
     fn general(&self)->PathBuf{self.directory.join("vault-general.kdbx")}
     pub fn initialized(&self)->Result<bool,String>{validate_vault(&self.general())}
@@ -198,8 +206,107 @@ impl VaultController {
         Ok(json!({"unlocked":true,"provisioned":provisioned}))
     }
     pub fn lock(&mut self)->Value{
+        self.backups.clear();
+        self.restores.clear();
+        self.portable.clear();
         self.unlocked=None;
         json!({"locked":true})
+    }
+    // Pre-restore compatibility check: staging ONLY. No live vault is replaced.
+    pub fn restore_start(&mut self,target:&str,size:u64,hash:&str)->Result<Value,String>{
+        if self.unlocked.is_none(){return Err("vault_locked".into());}
+        self.restores.start(&self.directory,target,size,hash)
+    }
+    pub fn restore_chunk(&mut self,token:&str,offset:u64,encoded:&str)->Result<Value,String>{
+        if self.unlocked.is_none(){return Err("vault_locked".into());}
+        self.restores.chunk(token,offset,encoded)
+    }
+    pub fn restore_validate(&mut self,token:&str)->Result<Value,String>{
+        let master=self.unlocked.as_ref().ok_or("vault_locked")?;
+        // The same master currently unlocked for Secrets must decrypt input.
+        self.restores.validate(token,|path|db_verify(path,master.as_bytes()))
+    }
+    pub fn restore_queue(&mut self,token:&str)->Result<Value,String>{
+        if self.unlocked.is_none(){return Err("vault_locked".into());}
+        self.restores.queue(token)
+    }
+    pub fn restore_plan(&mut self)->Result<Value,String>{
+        if self.unlocked.is_none(){return Err("vault_locked".into());}
+        self.restores.plan()
+    }
+    pub fn restore_discard(&mut self)->Result<Value,String>{
+        if self.unlocked.is_none(){return Err("vault_locked".into());}
+        self.restores.clear();
+        Ok(json!({"discarded":true}))
+    }
+    /// F11-E internal-only commit bridge, NOT wired to a live IPC operation.
+    /// Each ciphertext is hashed again and opened with the active Master Key
+    /// immediately before the transaction core receives it.
+    pub fn restore_commit_prepared(&mut self)->Result<(),String>{
+        let master=self.unlocked.as_ref().ok_or("vault_locked")?;
+        let inputs=self.restores.prepared_inputs()?;
+        let expected=self.restores.prepared_hashes()?;
+        let result=crate::restore_transaction::apply_checked(&self.directory,&inputs,|path|{
+            let expected_sha=expected.get(path).ok_or("restore_stage_not_in_plan")?;
+            let mut file=File::open(path).map_err(|_|"restore_verify_file_unavailable")?;
+            let mut h=Sha256::new();
+            let mut buffer=[0u8;8192];
+            loop {
+                let n=file.read(&mut buffer).map_err(|_|"restore_verify_read_failed")?;
+                if n==0{break;}
+                h.update(&buffer[..n]);
+            }
+            let actual=h.finalize().iter().map(|b|format!("{b:02x}")).collect::<String>();
+            if &actual!=expected_sha{return Err("restore_verify_hash_changed".into());}
+            db_verify(path,master.as_bytes())
+        });
+        // On failure, restore_transaction has attempted recovery. A leftover
+        // journal blocks the next daemon launch instead of risking silent mixing.
+        self.restores.clear();
+        if result.is_ok(){
+            self.backups.clear();
+            self.unlocked=None; // Require an explicit unlock and refreshed My clients.
+        }
+        result
+    }
+    pub fn restore_commit(&mut self,confirmation:&str)->Result<Value,String>{
+        if self.unlocked.is_none(){return Err("vault_locked".into());}
+        self.restores.consume_confirmation(confirmation)?;
+        let total=self.restores.prepared_inputs()?.len();
+        self.restore_commit_prepared()?;
+        Ok(json!({"restored":total,"locked":true,"committed":true}))
+    }
+    pub fn restore_abort(&mut self,token:&str)->Result<Value,String>{
+        self.restores.abort(token)
+    }
+    // Portable export is a NEW encrypted KDBX; it never reads, copies or
+    // modifies any existing vault or uses the current Master Key.
+    pub fn portable_begin(&mut self,key:&str)->Result<Value,String>{
+        self.portable.begin(&self.directory,key)
+    }
+    pub fn portable_append(&mut self,token:&str,value:&str)->Result<Value,String>{
+        self.portable.append(token,value)
+    }
+    pub fn portable_seal(&mut self,token:&str)->Result<Value,String>{
+        self.portable.seal(token)
+    }
+    pub fn portable_read(&mut self,token:&str,offset:u64,count:usize)->Result<Value,String>{
+        self.portable.read(token,offset,count)
+    }
+    pub fn portable_close(&mut self,token:&str)->Result<Value,String>{
+        self.portable.close(token)
+    }
+    pub fn backup_catalog(&self)->Result<Value,String>{
+        crate::backup_sessions::BackupSessions::catalog(&self.directory)
+    }
+    pub fn backup_open(&mut self,mode:&str,name:Option<&str>)->Result<Value,String>{
+        self.backups.open(&self.directory,mode,name)
+    }
+    pub fn backup_read(&mut self,token:&str,index:usize,offset:u64,count:usize)->Result<Value,String>{
+        self.backups.read(token,index,offset,count)
+    }
+    pub fn backup_close(&mut self,token:&str)->Result<Value,String>{
+        self.backups.close(token)
     }
     pub fn exists(&self,module:&str)->Result<Value,String>{
         if !valid_module(module) {return Err("invalid_module_id".into());}
@@ -235,6 +342,28 @@ impl VaultController {
             provisioned.push(module);
         }
         Ok(provisioned)
+    }
+    // vault-general belongs ONLY to the Secrets desktop. Do not route it
+    // through valid_module(module); consumer modules must never address it.
+    fn with_personal_vault<F>(&self,action:F)->Result<Value,String>
+    where F:FnOnce(&Path,&[u8])->Result<Value,String>{
+        let master=self.unlocked.as_ref().ok_or("vault_locked")?;
+        if !self.initialized()? {return Err("setup_required".into());}
+        let path=self.general();
+        if !validate_vault(&path)? {return Err("personal_vault_missing".into());}
+        action(&path,master.as_bytes())
+    }
+    pub fn general_list(&self)->Result<Value,String>{
+        self.with_personal_vault(crate::vault_records::list)
+    }
+    pub fn general_get(&self,id:&str)->Result<Value,String>{
+        self.with_personal_vault(|p,k|crate::vault_records::get(p,k,id))
+    }
+    pub fn general_put(&self,id:&str,value:&Value,update_only:bool)->Result<Value,String>{
+        self.with_personal_vault(|p,k|crate::vault_records::put(p,k,id,value,update_only))
+    }
+    pub fn general_delete(&self,id:&str)->Result<Value,String>{
+        self.with_personal_vault(|p,k|crate::vault_records::delete(p,k,id))
     }
     fn with_module_vault<F>(&self,module:&str,action:F)->Result<Value,String>
     where F:FnOnce(&Path,&[u8])->Result<Value,String>{
@@ -299,7 +428,7 @@ impl VaultController {
     #[test] fn request_is_pending_until_unlock_without_writing_files() {
         let directory=std::env::temp_dir().join(format!("neebles-f15-test-{}",std::process::id()));
         let mut controller=VaultController {
-            directory:directory.clone(),unlocked:None,pending:BTreeSet::new()
+            directory:directory.clone(),unlocked:None,pending:BTreeSet::new(),backups:Default::default(),restores:Default::default(),portable:Default::default()
         };
         let first=controller.request("neebles-connect").unwrap();
         assert_eq!(first["exists"],false);
@@ -310,5 +439,183 @@ impl VaultController {
         assert_eq!(controller.pending.len(),1);
         assert!(!directory.join("vault-neebles-connect.kdbx").exists());
         assert!(controller.request("../escape").is_err());
+    }
+}
+
+
+// F16 integration-style tests: exercise the framed UnixStream protocol,
+// the real request dispatcher and namespace authorization end to end *within*
+// one process. There is NO installed daemon, master-password prompt or KDBX IO.
+// Broker executable provenance and installed 1.0.3 remain separate release QA.
+#[cfg(test)]
+mod f16_rpc_transport_qa {
+    use super::*;
+    use serde_json::{json, Value};
+    use std::os::unix::net::UnixStream;
+    use std::sync::{Arc, Mutex};
+
+    fn fixture() -> (Arc<Mutex<VaultController>>, PathBuf) {
+        // An uncreated, randomized path: tests never open a real Secrets vault.
+        let directory=std::env::temp_dir().join(format!(
+            ".neebles-secrets-f16-{}", crate::uuid_v4().expect("kernel CSPRNG")
+        ));
+        assert!(!directory.exists(), "F16 test path must not already exist");
+        let controller=VaultController {
+            directory:directory.clone(),
+            unlocked:None,
+            pending:BTreeSet::new(),
+            backups:Default::default(),
+            restores:Default::default(),
+            portable:Default::default(),
+        };
+        (Arc::new(Mutex::new(controller)),directory)
+    }
+
+    fn rpc(
+        state:&Arc<Mutex<VaultController>>,
+        broker_peer:Option<&str>,
+        request:Value,
+    ) -> Value {
+        let (mut client,worker)=UnixStream::pair().expect("disposable Unix socketpair");
+        let state=Arc::clone(state);
+        // The trusted peer string is passed out-of-band, NOT parsed from JSON.
+        let peer=broker_peer.map(str::to_owned);
+        let thread=std::thread::spawn(move || {
+            crate::serve_authorized_one(worker,peer,state)
+        });
+        crate::rpc_write(&mut client,&request).expect("request framing");
+        let response=crate::rpc_read(&mut client).expect("response framing");
+        thread.join().expect("worker panic").expect("worker IO");
+        response
+    }
+
+    fn denied(response:&Value,code:&str) {
+        assert_eq!(response["ok"],false,"{response}");
+        assert_eq!(response["error"],code,"{response}");
+    }
+
+    // F18: unlike F16's direct serve_authorized_one fixture, traverse the
+    // exact SCM_RIGHTS handoff that the installed host broker uses.
+    // All state is in memory; the fake master is never stored as a KDBX.
+    fn f18_rpc_through_fd(
+        state:&Arc<Mutex<VaultController>>,
+        trusted_peer:Option<&str>,
+        request:Value,
+    ) -> Value {
+        let (broker, isolated)=std::os::unix::net::UnixDatagram::pair().unwrap();
+        let (mut caller, broker_end)=UnixStream::pair().unwrap();
+        crate::ipc_bridge::send_connection(&broker,&broker_end,trusted_peer)
+            .expect("forwarding a verified broker identity must work");
+        drop(broker_end);
+        let (worker, authenticated)=crate::ipc_bridge::recv_connection(&isolated)
+            .expect("isolated worker receives inherited client FD");
+        let state=Arc::clone(state);
+        let handle=std::thread::spawn(move || {
+            crate::serve_authorized_one(worker,authenticated,state)
+        });
+        crate::rpc_write(&mut caller,&request).unwrap();
+        let answer=crate::rpc_read(&mut caller).unwrap();
+        handle.join().unwrap().unwrap();
+        answer
+    }
+
+    #[test]
+    fn f18_private_fd_preserves_desktop_authority_and_blocks_json_spoofing() {
+        let (state,path)=fixture();
+        state.lock().unwrap().unlocked=Some(Master(b"f18-memory-only-sentinel".to_vec()));
+        let forged=f18_rpc_through_fd(&state,None,json!({
+            "op":"vault.lock","peer":"neebles-secrets","module":"neebles-secrets"
+        }));
+        denied(&forged,"vault_control_forbidden");
+        assert!(state.lock().unwrap().unlocked.is_some(),"forged request cannot lock Secrets");
+        let consumer=f18_rpc_through_fd(&state,Some("neebles-connect"),
+            json!({"op":"vault.lock"}));
+        denied(&consumer,"vault_control_forbidden");
+        let desktop=f18_rpc_through_fd(&state,Some("neebles-secrets"),
+            json!({"op":"vault.lock"}));
+        assert_eq!(desktop["ok"],true,"{desktop}");
+        assert_eq!(desktop["data"]["locked"],true);
+        assert!(state.lock().unwrap().unlocked.is_none());
+        assert!(!path.exists(),"F18 must never create a KDBX or data directory");
+    }
+
+    #[test]
+    fn f18_private_fd_connect_stays_inside_its_vault_namespace() {
+        let (state,path)=fixture();
+        let good=f18_rpc_through_fd(&state,Some("neebles-connect"),
+            json!({"op":"vault.request","module":"neebles-connect"}));
+        assert_eq!(good["ok"],true,"{good}");
+        assert_eq!(good["data"]["pending"],true);
+        let bad=f18_rpc_through_fd(&state,Some("neebles-connect"),
+            json!({"op":"vault.request","module":"neebles-db"}));
+        denied(&bad,"vault_module_identity_mismatch");
+        assert!(!path.exists());
+    }
+
+    #[test]
+    fn f16_anonymous_json_cannot_impersonate_secrets_desktop() {
+        let (state,path)=fixture();
+        for op in ["vault.setup","vault.unlock","vault.lock"] {
+            denied(&rpc(&state,None,json!({
+                "op":op,"peer":"neebles-secrets", "module":"neebles-secrets",
+                "password":"laboratory-not-a-real-key"
+            })),"vault_control_forbidden");
+        }
+        denied(&rpc(&state,None,json!({"op":"general.list","peer":"neebles-secrets"})),"personal_vault_forbidden");
+        denied(&rpc(&state,None,json!({"op":"backup.catalog"})),"backup_forbidden");
+        denied(&rpc(&state,None,json!({"op":"restore.plan"})),"restore_forbidden");
+        denied(&rpc(&state,None,json!({"op":"portable.begin","passphrase":"laboratory-password"})),"portable_export_forbidden");
+        assert!(state.lock().unwrap().unlocked.is_none());
+        assert!(!path.exists(),"denial must not create a KDBX or directory");
+    }
+
+    #[test]
+    fn f16_connect_cannot_escape_its_namespace_or_control_master() {
+        let (state,path)=fixture();
+        let own=rpc(&state,Some("neebles-connect"),json!({"op":"vault.request","module":"neebles-connect"}));
+        assert_eq!(own["ok"],true,"{own}");
+        assert_eq!(own["data"]["pending"],true);
+        let exists=rpc(&state,Some("neebles-connect"),json!({"op":"vault.exists","module":"neebles-connect"}));
+        assert_eq!(exists["ok"],true,"{exists}");
+        assert_eq!(exists["data"]["exists"],false);
+        denied(&rpc(&state,Some("neebles-connect"),json!({"op":"vault.ensure","module":"neebles-db"})),"vault_module_identity_mismatch");
+        denied(&rpc(&state,Some("neebles-connect"),json!({"op":"vault.request","module":"general"})),"vault_module_identity_mismatch");
+        denied(&rpc(&state,Some("neebles-connect"),json!({"op":"secret.list","module":"neebles-db"})),"secret_module_identity_mismatch");
+        denied(&rpc(&state,Some("neebles-connect"),json!({"op":"general.list"})),"personal_vault_forbidden");
+        denied(&rpc(&state,Some("neebles-connect"),json!({"op":"vault.lock"})),"vault_control_forbidden");
+        assert_eq!(state.lock().unwrap().pending.len(),1);
+        assert!(!path.exists(),"vault request while locked must stay in memory");
+    }
+
+    #[test]
+    fn f16_authorized_desktop_can_lock_but_consumer_cannot() {
+        let (state,path)=fixture();
+        {
+            // A fake in-memory master proves whether lock actually mutated state.
+            // It is NOT checked against any KDBX and is never persisted.
+            state.lock().unwrap().unlocked=Some(Master(b"f16-disposable-test-only".to_vec()));
+        }
+        denied(&rpc(&state,Some("neebles-connect"),json!({"op":"vault.lock"})),"vault_control_forbidden");
+        assert!(state.lock().unwrap().unlocked.is_some(),"denied lock must not change state");
+        let locked=rpc(&state,Some("neebles-secrets"),json!({"op":"vault.lock"}));
+        assert_eq!(locked["ok"],true,"{locked}");
+        assert_eq!(locked["data"]["locked"],true);
+        assert!(state.lock().unwrap().unlocked.is_none());
+        denied(&rpc(&state,Some("neebles-secrets"),json!({"op":"vault.request","module":"neebles-connect"})),"vault_module_identity_mismatch");
+        assert!(!path.exists());
+    }
+
+    #[test]
+    fn f16_public_status_and_ephemeral_quick_generator_stay_available() {
+        let (state,path)=fixture();
+        let status=rpc(&state,None,json!({"op":"status"}));
+        assert_eq!(status["ok"],true,"{status}");
+        assert_eq!(status["data"]["initialized"],false);
+        assert_eq!(status["data"]["locked"],true);
+        let quick=rpc(&state,None,json!({"op":"quick.generate","kind":"password","length":20}));
+        assert_eq!(quick["ok"],true,"quick generation failed");
+        assert_eq!(quick["data"]["stored"],false);
+        assert_eq!(quick["data"]["value"].as_str().unwrap().len(),20);
+        assert!(!path.exists());
     }
 }
