@@ -105,9 +105,161 @@ fn fresh_temp_file(dir:&Path, module:&str) -> Result<PathBuf,String> {
     let suffix=nonce.iter().map(|c|format!("{c:02x}")).collect::<String>();
     Ok(dir.join(format!(".vault-{module}-{suffix}.pending.kdbx")))
 }
+// F26-Q: the newly linked ciphertext must be durable *before* the request
+// journal can transition to succeeded. Never replace an existing KDBX.
+// This helper handles only filesystem publication: cryptographic verification
+// is done by create_once() before calling it, and by ensure() on EEXIST.
+fn publish_prepared_vault(dir:&Path,temp:&Path,target:&Path)->Result<bool,String>{
+    use std::os::unix::fs::OpenOptionsExt;
+    let file=OpenOptions::new().read(true).custom_flags(libc::O_NOFOLLOW).open(temp)
+        .map_err(|_|"vault_publish_source_unavailable")?;
+    let source=file.metadata().map_err(|_|"vault_publish_source_inspect_failed")?;
+    if !source.is_file() || source.uid()!=current_uid() || source.nlink()!=1
+        || source.permissions().mode() & 0o777 != 0o600 {
+        return Err("vault_publish_source_insecure".into());
+    }
+    // The KeePassXC output AND its mode are persisted before publishing its name.
+    file.sync_all().map_err(|_|"vault_publish_file_sync_failed")?;
+    match fs::hard_link(temp,target) {
+        Ok(())=>{
+            let published=fs::symlink_metadata(target)
+                .map_err(|_|"vault_publish_identity_unavailable")?;
+            if published.dev()!=source.dev() || published.ino()!=source.ino()
+                || !published.is_file() || published.file_type().is_symlink() {
+                return Err("vault_publish_identity_changed".into());
+            }
+            // Power-loss ordering: do not report successful publication to the
+            // journal until the directory containing vault-{module}.kdbx is synced.
+            File::open(dir).and_then(|f|f.sync_all())
+                .map_err(|_|"vault_publish_directory_sync_failed")?;
+            Ok(true)
+        },
+        Err(e) if e.kind()==std::io::ErrorKind::AlreadyExists=>Ok(false),
+        Err(_)=>Err("cannot publish new vault without replacement".into()),
+    }
+}
+// F26-R: inventory interrupted KeePassXC creation files without guessing what
+// they contain. Never remove or promote encrypted data without authenticated
+// recovery; that is a separate operation requiring the correct Master Key.
+fn inspect_orphaned_vault_temporaries(dir:&Path)->Result<BTreeSet<String>,String>{
+    validate_private_dir(dir)?;
+    let mut pending=BTreeSet::new();
+    let mut count=0usize;
+    for entry in fs::read_dir(dir).map_err(|_|"vault_recovery_scan_failed")? {
+        let entry=entry.map_err(|_|"vault_recovery_scan_failed")?;
+        let name=entry.file_name().into_string().map_err(|_|"vault_recovery_invalid_filename")?;
+        if !name.starts_with(".vault-") || !name.ends_with(".pending.kdbx") {continue;}
+        count+=1;
+        if count>64 {return Err("vault_recovery_too_many_temporaries".into());}
+        let body=name.strip_prefix(".vault-").and_then(|v|v.strip_suffix(".pending.kdbx"))
+            .ok_or("vault_recovery_invalid_filename")?;
+        let (module, nonce)=body.rsplit_once('-').ok_or("vault_recovery_invalid_filename")?;
+        if !(module=="general" || valid_module(module)) || nonce.len()!=32
+            || !nonce.bytes().all(|b|b.is_ascii_digit() || (b'a'..=b'f').contains(&b)) {
+            return Err("vault_recovery_invalid_filename".into());
+        }
+        let path=entry.path();
+        let meta=fs::symlink_metadata(&path).map_err(|_|"vault_recovery_inspect_failed")?;
+        if !meta.is_file() || meta.file_type().is_symlink() || meta.uid()!=current_uid()
+            || meta.permissions().mode() & 0o777!=0o600 || !(1..=2).contains(&meta.nlink()) {
+            return Err("vault_recovery_insecure_temporary".into());
+        }
+        // After a successful hard_link but before unlink, a valid temporary
+        // has two names referring to the SAME inode. Never trust another link.
+        if meta.nlink()==2 {
+            let target=dir.join(format!("vault-{module}.kdbx"));
+            let linked=fs::symlink_metadata(&target)
+                .map_err(|_|"vault_recovery_unrecognized_hardlink")?;
+            if !linked.is_file() || linked.file_type().is_symlink()
+                || linked.dev()!=meta.dev() || linked.ino()!=meta.ino() {
+                return Err("vault_recovery_unrecognized_hardlink".into());
+            }
+        }
+        pending.insert(module.to_owned());
+    }
+    Ok(pending)
+}
+// F26-S: authenticated, journal-scoped reconciliation of an interrupted vault
+// creation. No orphan is touched without the currently unlocked Master Key.
+// The verification callback is private: production passes KeePassXC db-info,
+// tests use fake bytes and deliberately do NOT exercise real cryptography.
+fn reconcile_orphaned_module_with<F>(dir:&Path,module:&str,verify:F)->Result<bool,String>
+where F:FnOnce(&Path)->Result<(),String>{
+    if !valid_module(module) {return Err("invalid_module_id".into());}
+    let pending=inspect_orphaned_vault_temporaries(dir)?;
+    if !pending.contains(module){return Ok(false);}
+    // No request journal intent, no automatic promotion or deletion. The
+    // personal vault is intentionally outside the module recovery operation.
+    let journal=crate::vault_request_journal::Journal::open(dir)?;
+    if !journal.pending_modules()?.contains(module){
+        return Err("vault_recovery_intent_missing".into());
+    }
+    let prefix=format!(".vault-{module}-");
+    let mut candidates=Vec::new();
+    for item in fs::read_dir(dir).map_err(|_|"vault_recovery_scan_failed")? {
+        let item=item.map_err(|_|"vault_recovery_scan_failed")?;
+        let name=item.file_name().into_string().map_err(|_|"vault_recovery_invalid_filename")?;
+        if name.starts_with(&prefix) && name.ends_with(".pending.kdbx") {
+            candidates.push(item.path());
+        }
+    }
+    if candidates.len()!=1 {return Err("vault_recovery_ambiguous_candidates".into());}
+    let temp=&candidates[0];
+    let target=dir.join(format!("vault-{module}.kdbx"));
+    // The first inventory verified the linked inode/ownership/modes. Re-check
+    // before and after decryption to detect a candidate swap.
+    let before=fs::symlink_metadata(temp).map_err(|_|"vault_recovery_source_missing")?;
+    if !before.is_file() || before.file_type().is_symlink()
+        || before.uid()!=current_uid() || before.permissions().mode() & 0o777!=0o600 {
+        return Err("vault_recovery_source_changed".into());
+    }
+    if !validate_vault(temp)? {return Err("vault_recovery_not_kdbx".into());}
+    // Production verifier is db_verify with the Master's bytes. A bad key or
+    // malformed ciphertext stops here, preserving both files and journal.
+    verify(temp)?;
+    let after=fs::symlink_metadata(temp).map_err(|_|"vault_recovery_source_missing")?;
+    if before.dev()!=after.dev() || before.ino()!=after.ino()
+        || before.len()!=after.len() || before.nlink()!=after.nlink()
+        || after.uid()!=current_uid() || after.permissions().mode() & 0o777!=0o600 {
+        return Err("vault_recovery_source_changed".into());
+    }
+    match fs::symlink_metadata(&target) {
+        Ok(meta)=>{
+            // The only acceptable existing target is F26-Q's own hardlink,
+            // made after cryptographic verification and before temp unlink.
+            if before.nlink()!=2 || meta.dev()!=before.dev() || meta.ino()!=before.ino()
+                || !meta.is_file() || meta.file_type().is_symlink() {
+                return Err("vault_recovery_target_ambiguous".into());
+            }
+            if !validate_vault(&target)? {return Err("vault_recovery_target_invalid".into());}
+            File::open(dir).and_then(|f|f.sync_all())
+                .map_err(|_|"vault_recovery_directory_sync_failed")?;
+        },
+        Err(e) if e.kind()==std::io::ErrorKind::NotFound=>{
+            if before.nlink()!=1 {return Err("vault_recovery_links_ambiguous".into());}
+            if !publish_prepared_vault(dir,temp,&target)? {
+                return Err("vault_recovery_concurrent_target".into());
+            }
+        },
+        Err(_)=>return Err("vault_recovery_target_inspect_failed".into()),
+    }
+    // Publication is durable before unlinking the matching encrypted temp.
+    // An interrupted unlink is idempotently recoverable using the same inode.
+    fs::remove_file(temp).map_err(|_|"vault_recovery_cleanup_failed")?;
+    File::open(dir).and_then(|f|f.sync_all())
+        .map_err(|_|"vault_recovery_cleanup_sync_failed")?;
+    // Journal is completed only by fulfill_pending after ensure() has re-verified
+    // the target and the request. Recovery itself cannot forge succeeded.
+    Ok(true)
+}
 fn create_once(dir:&Path,module:&str,password:&[u8]) -> Result<bool,String> {
     let target=dir.join(format!("vault-{module}.kdbx"));
     if validate_vault(&target)? {return Ok(false);}
+    // A crash may leave a valid encrypted temporary. Do not produce another
+    // candidate until a later authenticated recovery has reconciled it.
+    if inspect_orphaned_vault_temporaries(dir)?.contains(module){
+        return Err("vault_recovery_required".into());
+    }
     let temp=fresh_temp_file(dir,module)?;
     // create_new is a reservation against accidental collision; CLI creates its own file.
     let sentinel=OpenOptions::new().write(true).create_new(true).open(&temp)
@@ -120,16 +272,22 @@ fn create_once(dir:&Path,module:&str,password:&[u8]) -> Result<bool,String> {
             .map_err(|_|"cannot protect new vault permissions".to_string())?;
         if !validate_vault(&temp)? { return Err("KeePass did not create a valid KDBX".to_string()); }
         db_verify(&temp,password)?;
-        // Atomic create-if-absent. link() MUST fail instead of replacing an existing vault.
-        match fs::hard_link(&temp,&target) {
-            Ok(())=>Ok(true),
-            Err(e) if e.kind()==std::io::ErrorKind::AlreadyExists => {
+        // Atomic create-if-absent and durable publication before journal success.
+        match publish_prepared_vault(dir,&temp,&target)? {
+            true=>Ok(true),
+            false=>{
                 if validate_vault(&target)? { Ok(false) } else { Err("existing vault is invalid".into()) }
             },
-            Err(_)=>Err("cannot publish new vault without replacement".into())
         }
     })();
-    let _=fs::remove_file(&temp);
+    // The temporary name must also be durably removed to avoid stale encrypted
+    // files after a successful operation. A cleanup failure cannot report success.
+    let cleaned=fs::remove_file(&temp);
+    if result.is_ok() {
+        cleaned.map_err(|_|"vault_temporary_cleanup_failed")?;
+        File::open(dir).and_then(|f|f.sync_all())
+            .map_err(|_|"vault_temporary_cleanup_sync_failed")?;
+    }
     result
 }
 // Contract destined for the authenticated Boss module IPC. Values are opaque strings.
@@ -160,12 +318,18 @@ impl VaultController {
         // This reads only encrypted files and the recovery journal; it never needs
         // the Master Key. Fail closed when rollback cannot be proven complete.
         crate::restore_transaction::recover(&folder)?;
-        Ok(Self {directory:folder,unlocked:None,pending:BTreeSet::new(),backups:Default::default(),restores:Default::default(),portable:Default::default()})
+        // Inspection only: never delete or promote orphan ciphertext at startup.
+        inspect_orphaned_vault_temporaries(&folder)?;
+        // Recover authenticated request intents without needing the Master Key.
+        // Completed requests are not recreated after an ambiguous timeout.
+        let pending=crate::vault_request_journal::Journal::open(&folder)?.pending_modules()?;
+        Ok(Self {directory:folder,unlocked:None,pending,backups:Default::default(),restores:Default::default(),portable:Default::default()})
     }
     fn general(&self)->PathBuf{self.directory.join("vault-general.kdbx")}
     pub fn initialized(&self)->Result<bool,String>{validate_vault(&self.general())}
     pub fn status(&self)->Result<Value,String>{
         let initialized=self.initialized()?;
+        let recovery_required=!inspect_orphaned_vault_temporaries(&self.directory)?.is_empty();
         // A daemon/socket can outlive module Uninstall. Requiring the canonical
         // installed manifest prevents orphan F17-style processes from passing
         // consumers' installation prerequisites.
@@ -177,12 +341,14 @@ impl VaultController {
                     .is_some_and(|item| {
                         item.get("schema").and_then(Value::as_u64)==Some(4)
                         && item.get("name").and_then(Value::as_str)==Some("neebles-secrets")
-                        && item.get("entrypoint").and_then(Value::as_str)==Some("runtime/neebles-secrets-ui")
+                        && item.get("version").and_then(Value::as_str)==Some(env!("CARGO_PKG_VERSION"))
+                        && matches!(item.get("entrypoint").and_then(Value::as_str),
+                            Some("runtime/neebles-secrets-ui" | "runtime/neebles-secrets"))
                     })
             },
             _ => false
         };
-        Ok(json!({"locked":self.unlocked.is_none(),"initialized":initialized,"installed":installed,"vaults_ready":initialized&&self.unlocked.is_some(),"service":"neebles-secrets","protocol":1,
+        Ok(json!({"locked":self.unlocked.is_none(),"initialized":initialized,"installed":installed,"vaults_ready":initialized&&self.unlocked.is_some(),"vault_recovery_required":recovery_required,"service":"neebles-secrets","protocol":1,
                   "boss_variables":public_boss_variables(initialized,self.unlocked.is_none())}))
     }
     pub fn setup(&mut self, password:&str)->Result<Value,String>{
@@ -192,7 +358,12 @@ impl VaultController {
         }
         create_once(&self.directory,"general",password.as_bytes())?;
         self.unlocked=Some(Master(password.as_bytes().to_vec()));
-        let provisioned=self.fulfill_pending()?;
+        // F26-V: a failed pending-vault reconciliation must not leave an
+        // unlocked controller after its caller was told setup failed.
+        let provisioned=match self.fulfill_pending(){
+            Ok(items)=>items,
+            Err(error)=>{self.unlocked=None;return Err(error);}
+        };
         Ok(json!({"initialized":true,"unlocked":true,"vault":"general","provisioned":provisioned}))
     }
     pub fn unlock(&mut self,password:&str)->Result<Value,String>{
@@ -202,7 +373,12 @@ impl VaultController {
         }
         db_verify(&self.general(),password.as_bytes())?;
         self.unlocked=Some(Master(password.as_bytes().to_vec()));
-        let provisioned=self.fulfill_pending()?;
+        // F26-V: fail closed if cryptographic reconciliation, KDBX publication
+        // or journal completion fails after the general KDBX was opened.
+        let provisioned=match self.fulfill_pending(){
+            Ok(items)=>items,
+            Err(error)=>{self.unlocked=None;return Err(error);}
+        };
         Ok(json!({"unlocked":true,"provisioned":provisioned}))
     }
     pub fn lock(&mut self)->Value{
@@ -313,6 +489,65 @@ impl VaultController {
         let exists=validate_vault(&self.directory.join(format!("vault-{module}.kdbx")))?;
         Ok(json!({"module":module,"exists":exists,"locked":self.unlocked.is_none()}))
     }
+    /// Boss future endpoint: durable request identity. Caller is authenticated by
+    /// the outer provider + broker before invoking this worker method.
+    /// It is intentionally NOT exported by the Boss commands contract yet.
+    pub fn request_with_id(&mut self,module:&str,request_id:&str)->Result<Value,String>{
+        if !valid_module(module){return Err("invalid_module_id".into());}
+        let ledger=crate::vault_request_journal::Journal::open(&self.directory)?;
+        let previous=ledger.status(module,request_id)?;
+        if previous==Some(crate::vault_request_journal::State::Succeeded) {
+            if !validate_vault(&self.directory.join(format!("vault-{module}.kdbx")))? {
+                return Err("completed_vault_request_missing_vault".into());
+            }
+            // Never create again with an already-completed idempotency key.
+            return Ok(json!({"module":module,"request_id":request_id,
+                "exists":true,"pending":false,"replayed":true}));
+        }
+        if !self.pending.contains(module) && self.pending.len()>=32 {
+            return Err("too_many_pending_vaults".into());
+        }
+        // Durable intent is committed before any KeePass operation.
+        ledger.claim(module,request_id)?;
+        self.pending.insert(module.to_string());
+        if self.unlocked.is_some() {
+            // An interrupted prior request may have left one encrypted temp.
+            // Reconcile using the authenticated Master Key before ensure().
+            if inspect_orphaned_vault_temporaries(&self.directory)?.contains(module) {
+                let master=self.unlocked.as_ref().ok_or("vault_locked")?;
+                reconcile_orphaned_module_with(&self.directory,module,
+                    |path|db_verify(path,master.as_bytes()))?;
+            }
+            self.ensure(module)?;
+            ledger.complete_module(module)?;
+            self.pending.remove(module);
+            return Ok(json!({"module":module,"request_id":request_id,
+                "exists":true,"pending":false,"replayed":previous.is_some()}));
+        }
+        // When locked, even a valid KDBX header is not proof of decryption.
+        let exists=validate_vault(&self.directory.join(format!("vault-{module}.kdbx")))?;
+        Ok(json!({"module":module,"request_id":request_id,
+            "exists":exists,"pending":true,"replayed":previous.is_some()}))
+    }
+    /// Read-only status of a durable request by the authenticated vault owner.
+    /// An absent request is not an authorization to create one. If a completed
+    /// request has lost its KDBX, never claim successful restoration.
+    pub fn request_status_with_id(&self,module:&str,request_id:&str)->Result<Value,String>{
+        if !valid_module(module){return Err("invalid_module_id".into());}
+        let ledger=crate::vault_request_journal::Journal::open(&self.directory)?;
+        let state=ledger.status(module,request_id)?;
+        match state {
+            None => Ok(json!({"module":module,"request_id":request_id,"state":"not_found"})),
+            Some(crate::vault_request_journal::State::Pending) => Ok(json!({
+                "module":module,"request_id":request_id,"state":"pending"})),
+            Some(crate::vault_request_journal::State::Succeeded) => {
+                if !validate_vault(&self.directory.join(format!("vault-{module}.kdbx")))? {
+                    return Err("completed_vault_request_missing_vault".into());
+                }
+                Ok(json!({"module":module,"request_id":request_id,"state":"succeeded"}))
+            }
+        }
+    }
     // A consumer requests a Vault, but only the Secrets service creates it.
     // A locked service keeps the request in memory until Qt unlocks it.
     // Requests do NOT create vaults during module installation or startup.
@@ -328,6 +563,7 @@ impl VaultController {
         self.pending.insert(module.to_string());
         if self.unlocked.is_some() && self.initialized()? {
             self.ensure(module)?;
+            crate::vault_request_journal::Journal::open(&self.directory)?.complete_module(module)?;
             self.pending.remove(module);
             return Ok(json!({"module":module,"exists":true,"pending":false}));
         }
@@ -337,7 +573,15 @@ impl VaultController {
         let modules=self.pending.iter().cloned().collect::<Vec<_>>();
         let mut provisioned=Vec::new();
         for module in modules {
+            // When an interrupted creation survives, authenticate and publish
+            // its ciphertext instead of generating another KDBX for this ID.
+            if inspect_orphaned_vault_temporaries(&self.directory)?.contains(&module) {
+                let master=self.unlocked.as_ref().ok_or("vault_locked")?;
+                reconcile_orphaned_module_with(&self.directory,&module,
+                    |path|db_verify(path,master.as_bytes()))?;
+            }
             self.ensure(&module)?;
+            crate::vault_request_journal::Journal::open(&self.directory)?.complete_module(&module)?;
             self.pending.remove(&module);
             provisioned.push(module);
         }
@@ -404,6 +648,314 @@ impl VaultController {
 
 #[cfg(test)] mod tests {
     use super::*;
+    // F26-V: These tests must run ONLY as individually selected, ignored
+    // Rust tests inside the disposable keepass-full Bubblewrap world. They
+    // exercise actual KeePassXC/KDBX, not the fake-byte recovery fixtures.
+    // The Python harness mounts no host HOME, /opt, or Boss IPC socket.
+    fn f26v_random_key()->String {
+        let mut entropy=[0u8;32];
+        File::open("/dev/urandom").unwrap().read_exact(&mut entropy).unwrap();
+        entropy.iter().map(|x|format!("{x:02x}")).collect()
+    }
+    fn f26v_paths()->(PathBuf,PathBuf) {
+        assert_eq!(std::env::var("NEEBLES_F26V_SANDBOX").unwrap(),"disposable-only");
+        assert_eq!(std::env::var("XDG_DATA_HOME").unwrap(),"/qa-data");
+        let world=PathBuf::from("/qa-data/neebles-secrets/vaults");
+        // Refuse to run in an ordinary host test environment, even with
+        // --ignored, unless the isolated scratch is mounted as expected.
+        assert!(Path::new("/qa-data").is_dir());
+        (PathBuf::from("/qa-data"),world)
+    }
+    #[test]
+    #[ignore = "F26-V: requires disposable bwrap and genuine keepass-full"]
+    fn f26v_real_controller_pending_restart_unlock_idempotency(){
+        let (_scratch,dir)=f26v_paths();
+        let password=f26v_random_key();
+        let wrong=f26v_random_key();
+        assert_ne!(password,wrong);
+        let module="neebles-connect";
+        let request_id="11111111111111111111111111111111";
+        let target=dir.join("vault-neebles-connect.kdbx");
+        let general=dir.join("vault-general.kdbx");
+        let mut c=VaultController::new().unwrap();
+        assert!(!c.initialized().unwrap());
+        assert_eq!(c.request_with_id(module,request_id).unwrap()["pending"],true);
+        assert_eq!(c.request_with_id(module,request_id).unwrap()["replayed"],true);
+        assert!(!target.exists());
+        drop(c);
+        let mut c=VaultController::new().unwrap();
+        assert_eq!(c.request_status_with_id(module,request_id).unwrap()["state"],"pending");
+        c.setup(&password).unwrap();
+        assert!(c.initialized().unwrap());
+        assert!(validate_vault(&general).unwrap());
+        assert!(validate_vault(&target).unwrap());
+        assert_eq!(c.request_status_with_id(module,request_id).unwrap()["state"],"succeeded");
+        db_verify(&general,password.as_bytes()).unwrap();
+        db_verify(&target,password.as_bytes()).unwrap();
+        assert!(db_verify(&target,wrong.as_bytes()).is_err());
+        let ciphertext=fs::read(&target).unwrap();
+        assert_eq!(c.request_with_id(module,request_id).unwrap()["replayed"],true);
+        assert_eq!(fs::read(&target).unwrap(),ciphertext);
+        c.lock();
+        assert!(c.unlock(&wrong).is_err());
+        assert!(c.unlocked.is_none());
+        assert_eq!(fs::read(&target).unwrap(),ciphertext);
+        c.unlock(&password).unwrap();
+        assert_eq!(c.request_with_id(module,"22222222222222222222222222222222").unwrap()["pending"],false);
+        assert_eq!(fs::read(&target).unwrap(),ciphertext);
+        drop(c);
+        let reloaded=VaultController::new().unwrap();
+        assert_eq!(reloaded.request_status_with_id(module,request_id).unwrap()["state"],"succeeded");
+        assert!(reloaded.unlocked.is_none());
+    }
+    #[test]
+    #[ignore = "F26-V: requires disposable bwrap and genuine keepass-full"]
+    fn f26v_real_controller_recovers_encrypted_orphan_after_restart(){
+        let (_scratch,dir)=f26v_paths();
+        let password=f26v_random_key();
+        let module="neebles-db";
+        let rid="33333333333333333333333333333333";
+        let mut c=VaultController::new().unwrap();
+        c.setup(&password).unwrap();
+        c.lock();
+        assert_eq!(c.request_with_id(module,rid).unwrap()["pending"],true);
+        let temp=fresh_temp_file(&dir,module).unwrap();
+        db_create(&temp,password.as_bytes()).unwrap();
+        fs::set_permissions(&temp,fs::Permissions::from_mode(0o600)).unwrap();
+        assert!(validate_vault(&temp).unwrap());
+        let ciphertext=fs::read(&temp).unwrap();
+        drop(c);
+        let mut c=VaultController::new().unwrap();
+        assert_eq!(c.request_status_with_id(module,rid).unwrap()["state"],"pending");
+        c.unlock(&password).unwrap();
+        let published=dir.join("vault-neebles-db.kdbx");
+        assert!(!temp.exists());
+        assert_eq!(fs::read(&published).unwrap(),ciphertext);
+        assert_eq!(c.request_status_with_id(module,rid).unwrap()["state"],"succeeded");
+        assert_eq!(c.request_with_id(module,rid).unwrap()["replayed"],true);
+        db_verify(&published,password.as_bytes()).unwrap();
+    }
+    #[test]
+    #[ignore = "F26-V: requires disposable bwrap and genuine keepass-full"]
+    fn f26v_real_wrong_orphan_key_preserved_and_controller_fail_closed(){
+        let (_scratch,dir)=f26v_paths();
+        let password=f26v_random_key();
+        let other_password=f26v_random_key();
+        assert_ne!(password,other_password);
+        let module="neebles-db";
+        let rid="44444444444444444444444444444444";
+        let mut c=VaultController::new().unwrap();
+        c.setup(&password).unwrap();
+        c.lock();
+        c.request_with_id(module,rid).unwrap();
+        let temp=fresh_temp_file(&dir,module).unwrap();
+        db_create(&temp,other_password.as_bytes()).unwrap();
+        fs::set_permissions(&temp,fs::Permissions::from_mode(0o600)).unwrap();
+        let ciphertext=fs::read(&temp).unwrap();
+        drop(c);
+        let mut c=VaultController::new().unwrap();
+        assert!(c.unlock(&password).is_err());
+        assert!(c.unlocked.is_none(),"failed reconcile must remain locked");
+        assert_eq!(c.request_status_with_id(module,rid).unwrap()["state"],"pending");
+        assert_eq!(fs::read(&temp).unwrap(),ciphertext);
+        assert!(!dir.join("vault-neebles-db.kdbx").exists());
+        assert!(db_verify(&temp,other_password.as_bytes()).is_ok());
+    }
+    // F26-Q tests are filesystem-only and use arbitrary bytes, NOT real KDBX.
+    // They exercise atomic publication, never KeePassXC or a live vault.
+    fn f26q_fixture()->PathBuf {
+        let root=std::env::temp_dir().join(format!(".neebles-f26q-{}",crate::uuid_v4().unwrap()));
+        fs::create_dir(&root).unwrap();
+        fs::set_permissions(&root,fs::Permissions::from_mode(0o700)).unwrap();
+        root
+    }
+    fn f26q_temp(root:&Path,name:&str,body:&[u8])->PathBuf {
+        use std::os::unix::fs::OpenOptionsExt;
+        let path=root.join(name);
+        let mut file=OpenOptions::new().write(true).create_new(true).mode(0o600)
+            .open(&path).unwrap();
+        file.write_all(body).unwrap();
+        path
+    }
+    #[test] fn f26q_publish_fsyncs_and_never_overwrites_a_prior_target(){
+        let root=f26q_fixture();
+        let first=f26q_temp(&root,"first.pending",b"fake-A-not-a-KDBX");
+        let second=f26q_temp(&root,"second.pending",b"fake-B-not-a-KDBX");
+        let target=root.join("vault-neebles-connect.kdbx");
+        assert!(publish_prepared_vault(&root,&first,&target).unwrap());
+        assert!(!publish_prepared_vault(&root,&second,&target).unwrap());
+        assert_eq!(fs::read(&target).unwrap(),b"fake-A-not-a-KDBX");
+        assert_eq!(fs::metadata(&first).unwrap().ino(),fs::metadata(&target).unwrap().ino());
+        fs::remove_dir_all(root).unwrap();
+    }
+    #[test] fn f26q_concurrent_publishers_have_exactly_one_winner(){
+        use std::sync::{Arc,Barrier};
+        let root=f26q_fixture();
+        let first=f26q_temp(&root,"first.pending",b"mock-one");
+        let second=f26q_temp(&root,"second.pending",b"mock-two");
+        let target=root.join("vault-neebles-connect.kdbx");
+        let gate=Arc::new(Barrier::new(3));
+        let mut jobs=Vec::new();
+        for candidate in [first,second] {
+            let root=root.clone(); let target=target.clone(); let gate=Arc::clone(&gate);
+            jobs.push(thread::spawn(move || {
+                gate.wait();
+                publish_prepared_vault(&root,&candidate,&target).unwrap()
+            }));
+        }
+        gate.wait();
+        let winners=jobs.into_iter().map(|handle|handle.join().unwrap()).filter(|winner|*winner).count();
+        assert_eq!(winners,1);
+        let bytes=fs::read(&target).unwrap();
+        assert!(bytes.as_slice()==b"mock-one" || bytes.as_slice()==b"mock-two");
+        fs::remove_dir_all(root).unwrap();
+    }
+    #[test] fn f26q_refuses_to_publish_an_insecure_or_symlinked_source(){
+        use std::os::unix::fs::symlink;
+        let root=f26q_fixture();
+        let target=root.join("vault-neebles-connect.kdbx");
+        let insecure=f26q_temp(&root,"insecure.pending",b"mock");
+        fs::set_permissions(&insecure,fs::Permissions::from_mode(0o644)).unwrap();
+        assert!(publish_prepared_vault(&root,&insecure,&target).is_err());
+        assert!(!target.exists());
+        let link=root.join("linked.pending");
+        symlink(&insecure,&link).unwrap();
+        assert!(publish_prepared_vault(&root,&link,&target).is_err());
+        assert!(!target.exists());
+        fs::remove_dir_all(root).unwrap();
+    }
+    // All F26-R fixtures contain fake bytes and are never opened by KeePassXC.
+    #[test] fn f26r_reports_orphans_without_reading_or_removing_them(){
+        let root=f26q_fixture();
+        let file=f26q_temp(&root,
+            ".vault-neebles-connect-0123456789abcdef0123456789abcdef.pending.kdbx",b"fake encrypted bytes");
+        let pending=inspect_orphaned_vault_temporaries(&root).unwrap();
+        assert_eq!(pending,BTreeSet::from(["neebles-connect".to_owned()]));
+        assert_eq!(fs::read(&file).unwrap(),b"fake encrypted bytes");
+        // A second creation must fail before invoking keepassxc-cli.
+        assert_eq!(create_once(&root,"neebles-connect",b"not-a-real-key").unwrap_err(),
+                   "vault_recovery_required");
+        assert_eq!(fs::read(&file).unwrap(),b"fake encrypted bytes");
+        assert!(!root.join("vault-neebles-connect.kdbx").exists());
+        fs::remove_dir_all(root).unwrap();
+    }
+    #[test] fn f26r_rejects_symlinks_wrong_modes_and_unknown_names(){
+        use std::os::unix::fs::symlink;
+        let root=f26q_fixture();
+        let name=".vault-general-0123456789abcdef0123456789abcdef.pending.kdbx";
+        let file=f26q_temp(&root,name,b"fake");
+        fs::set_permissions(&file,fs::Permissions::from_mode(0o644)).unwrap();
+        assert!(inspect_orphaned_vault_temporaries(&root).is_err());
+        fs::set_permissions(&file,fs::Permissions::from_mode(0o600)).unwrap();
+        assert!(inspect_orphaned_vault_temporaries(&root).unwrap().contains("general"));
+        fs::remove_file(&file).unwrap();
+        symlink("/does/not/exist",&file).unwrap();
+        assert!(inspect_orphaned_vault_temporaries(&root).is_err());
+        fs::remove_file(&file).unwrap();
+        let bad=f26q_temp(&root,".vault-neebles-db-INVALID.pending.kdbx",b"fake");
+        assert!(inspect_orphaned_vault_temporaries(&root).is_err());
+        fs::remove_file(bad).unwrap();
+        fs::remove_dir_all(root).unwrap();
+    }
+    #[test] fn f26r_recognizes_only_own_published_hardlink(){
+        let root=f26q_fixture();
+        let name=".vault-neebles-db-fedcba9876543210fedcba9876543210.pending.kdbx";
+        let file=f26q_temp(&root,name,b"fake pending bytes");
+        let target=root.join("vault-neebles-db.kdbx");
+        fs::hard_link(&file,&target).unwrap();
+        assert!(inspect_orphaned_vault_temporaries(&root).unwrap().contains("neebles-db"));
+        // The target must be the *same inode*. An unrelated second hard link
+        // cannot make the temporary safe or eligible for deletion.
+        fs::remove_file(&target).unwrap();
+        fs::hard_link(&file,root.join("unrelated-link")).unwrap();
+        assert!(inspect_orphaned_vault_temporaries(&root).is_err());
+        assert_eq!(fs::read(&file).unwrap(),b"fake pending bytes");
+        fs::remove_dir_all(root).unwrap();
+    }
+    fn f26s_fake_kdbx()->Vec<u8>{
+        let mut raw=vec![0u8;160];
+        raw[..4].copy_from_slice(&[0x03,0xd9,0xa2,0x9a]);
+        raw
+    }
+    const F26S_ID:&str="0123456789abcdef0123456789abcdef";
+    fn f26s_candidate(root:&Path,module:&str)->PathBuf {
+        f26q_temp(root,&format!(".vault-{module}-{F26S_ID}.pending.kdbx"),&f26s_fake_kdbx())
+    }
+    fn f26s_intent(root:&Path,module:&str){
+        crate::vault_request_journal::Journal::open(root).unwrap().claim(module,F26S_ID).unwrap();
+    }
+    #[test] fn f26s_reconciles_single_authenticated_pending_candidate(){
+        let root=f26q_fixture();
+        f26s_intent(&root,"neebles-connect");
+        let temp=f26s_candidate(&root,"neebles-connect");
+        let recovered=reconcile_orphaned_module_with(&root,"neebles-connect",|path|{
+            assert_eq!(path,temp.as_path());
+            assert_eq!(fs::read(path).unwrap(),f26s_fake_kdbx());
+            Ok(())
+        }).unwrap();
+        assert!(recovered);
+        let target=root.join("vault-neebles-connect.kdbx");
+        assert!(!temp.exists());
+        assert_eq!(fs::read(target).unwrap(),f26s_fake_kdbx());
+        let journal=crate::vault_request_journal::Journal::open(&root).unwrap();
+        assert_eq!(journal.status("neebles-connect",F26S_ID).unwrap(),
+            Some(crate::vault_request_journal::State::Pending));
+        journal.complete_module("neebles-connect").unwrap();
+        assert_eq!(journal.status("neebles-connect",F26S_ID).unwrap(),
+            Some(crate::vault_request_journal::State::Succeeded));
+        fs::remove_dir_all(root).unwrap();
+    }
+    #[test] fn f26s_recovers_published_hardlink_after_interrupted_unlink(){
+        let root=f26q_fixture();
+        f26s_intent(&root,"neebles-db");
+        let temp=f26s_candidate(&root,"neebles-db");
+        let target=root.join("vault-neebles-db.kdbx");
+        fs::hard_link(&temp,&target).unwrap();
+        assert_eq!(fs::metadata(&temp).unwrap().ino(),fs::metadata(&target).unwrap().ino());
+        assert!(reconcile_orphaned_module_with(&root,"neebles-db",|_|Ok(())).unwrap());
+        assert!(!temp.exists());
+        assert_eq!(fs::read(&target).unwrap(),f26s_fake_kdbx());
+        fs::remove_dir_all(root).unwrap();
+    }
+    #[test] fn f26s_never_recovers_without_matching_pending_intent(){
+        let root=f26q_fixture();
+        let temp=f26s_candidate(&root,"neebles-connect");
+        f26s_intent(&root,"neebles-db");
+        assert_eq!(reconcile_orphaned_module_with(&root,"neebles-connect",|_|{
+            panic!("must not verify orphan lacking its own durable request")
+        }).unwrap_err(),"vault_recovery_intent_missing");
+        assert!(temp.exists());
+        assert!(!root.join("vault-neebles-connect.kdbx").exists());
+        fs::remove_dir_all(root).unwrap();
+    }
+    #[test] fn f26s_bad_master_or_multiple_candidates_preserve_all_bytes(){
+        let root=f26q_fixture();
+        f26s_intent(&root,"neebles-connect");
+        let temp=f26s_candidate(&root,"neebles-connect");
+        assert_eq!(reconcile_orphaned_module_with(&root,"neebles-connect",|_|{
+            Err("vault_recovery_master_key_rejected".to_owned())
+        }).unwrap_err(),"vault_recovery_master_key_rejected");
+        assert!(temp.exists());
+        let other=f26q_temp(&root,
+            ".vault-neebles-connect-fedcba9876543210fedcba9876543210.pending.kdbx",
+            &f26s_fake_kdbx());
+        assert_eq!(reconcile_orphaned_module_with(&root,"neebles-connect",|_|{
+            panic!("two candidates must fail before verification")
+        }).unwrap_err(),"vault_recovery_ambiguous_candidates");
+        assert!(temp.exists() && other.exists());
+        fs::remove_dir_all(root).unwrap();
+    }
+    #[test] fn f26s_unrelated_existing_target_blocks_recovery_without_unlink(){
+        let root=f26q_fixture();
+        f26s_intent(&root,"neebles-connect");
+        let temp=f26s_candidate(&root,"neebles-connect");
+        let target=f26q_temp(&root,"vault-neebles-connect.kdbx",&f26s_fake_kdbx());
+        assert_eq!(reconcile_orphaned_module_with(&root,"neebles-connect",|_|Ok(())).unwrap_err(),
+            "vault_recovery_target_ambiguous");
+        assert!(temp.exists());
+        assert_eq!(fs::read(target).unwrap(),f26s_fake_kdbx());
+        fs::remove_dir_all(root).unwrap();
+    }
     #[test] fn boss_states_are_strings_and_fail_closed() {
         let unconfigured = public_boss_variables(false, true);
         assert_eq!(unconfigured["master_key"], "false");
@@ -421,6 +973,83 @@ impl VaultController {
     #[test] fn module_names_cannot_escape_namespace(){
         for name in ["../x","general","neebles/evil","neebles_connect", "","-evil","neebles-", "UPPER"]{assert!(!valid_module(name));}
         for name in ["neebles-connect","neebles-db","proxy"]{assert!(valid_module(name));}
+    }
+    #[test] fn durable_request_ids_wait_for_unlock_and_survive_process_restart(){
+        let folder=std::env::temp_dir().join(format!(".neebles-f26l-vault-{}",crate::uuid_v4().unwrap()));
+        std::fs::create_dir(&folder).unwrap();
+        std::fs::set_permissions(&folder,std::fs::Permissions::from_mode(0o700)).unwrap();
+        let mut controller=VaultController { directory:folder.clone(),unlocked:None,
+            pending:BTreeSet::new(),backups:Default::default(),restores:Default::default(),portable:Default::default() };
+        let rid="deadbeefdeadbeefdeadbeefdeadbeef";
+        let first=controller.request_with_id("neebles-connect",rid).unwrap();
+        assert_eq!(first["exists"],false);
+        assert_eq!(first["pending"],true);
+        assert_eq!(first["replayed"],false);
+        assert_eq!(controller.request_with_id("neebles-connect",rid).unwrap()["replayed"],true);
+        let pending=crate::vault_request_journal::Journal::open(&folder).unwrap().pending_modules().unwrap();
+        assert_eq!(pending,BTreeSet::from(["neebles-connect".to_owned()]));
+        assert!(!folder.join("vault-neebles-connect.kdbx").exists());
+        std::fs::remove_dir_all(folder).unwrap();
+    }
+    #[test] fn boss_worker_request_and_status_are_durable_without_unlock(){
+        let root=std::env::temp_dir().join(format!(".neebles-f26n-{}",crate::uuid_v4().unwrap()));
+        std::fs::create_dir(&root).unwrap();
+        std::fs::set_permissions(&root,std::fs::Permissions::from_mode(0o700)).unwrap();
+        let state=std::sync::Arc::new(std::sync::Mutex::new(VaultController {
+            directory:root.clone(),unlocked:None,pending:BTreeSet::new(),
+            backups:Default::default(),restores:Default::default(),portable:Default::default()
+        }));
+        let rid="deadbeefdeadbeefdeadbeefdeadbeef";
+        let msg=json!({"op":"vault.request_id","module":"neebles-connect","request_id":rid});
+        let first=crate::handle(&msg,Some("neebles-connect"),&state);
+        assert_eq!(first["ok"],true);
+        assert_eq!(first["data"]["pending"],true);
+        assert_eq!(first["data"]["replayed"],false);
+        let again=crate::handle(&msg,Some("neebles-connect"),&state);
+        assert_eq!(again["data"]["replayed"],true);
+        let status=json!({"op":"vault.request_status","module":"neebles-connect","request_id":rid});
+        assert_eq!(crate::handle(&status,Some("neebles-connect"),&state)["data"]["state"],"pending");
+        assert!(!root.join("vault-neebles-connect.kdbx").exists());
+        std::fs::remove_dir_all(root).unwrap();
+    }
+    #[test] fn boss_worker_rejects_cross_vault_forgery_and_untrusted_fields(){
+        let root=std::env::temp_dir().join(format!(".neebles-f26n-{}",crate::uuid_v4().unwrap()));
+        std::fs::create_dir(&root).unwrap();
+        std::fs::set_permissions(&root,std::fs::Permissions::from_mode(0o700)).unwrap();
+        let state=std::sync::Arc::new(std::sync::Mutex::new(VaultController {
+            directory:root.clone(),unlocked:None,pending:BTreeSet::new(),
+            backups:Default::default(),restores:Default::default(),portable:Default::default()
+        }));
+        let rid="deadbeefdeadbeefdeadbeefdeadbeef";
+        for op in ["vault.request_id","vault.request_status"] {
+            let msg=json!({"op":op,"module":"neebles-connect","request_id":rid});
+            assert_eq!(crate::handle(&msg,Some("neebles-other"),&state)["ok"],false);
+            assert_eq!(crate::handle(&msg,None,&state)["ok"],false);
+            let mut extra=msg.clone(); extra["password"]=json!("MUST_NOT_LEAK");
+            let refused=crate::handle(&extra,Some("neebles-connect"),&state);
+            assert_eq!(refused["ok"],false);
+            assert!(!refused.to_string().contains("MUST_NOT_LEAK"));
+            let mut bad=msg; bad["request_id"]=json!("../wrong");
+            assert_eq!(crate::handle(&bad,Some("neebles-connect"),&state)["ok"],false);
+        }
+        assert!(!root.join("vault-neebles-connect.kdbx").exists());
+        std::fs::remove_dir_all(root).unwrap();
+    }
+    #[test] fn worker_status_missing_request_never_creates_vault(){
+        let root=std::env::temp_dir().join(format!(".neebles-f26n-{}",crate::uuid_v4().unwrap()));
+        std::fs::create_dir(&root).unwrap();
+        std::fs::set_permissions(&root,std::fs::Permissions::from_mode(0o700)).unwrap();
+        let state=std::sync::Arc::new(std::sync::Mutex::new(VaultController {
+            directory:root.clone(),unlocked:None,pending:BTreeSet::new(),
+            backups:Default::default(),restores:Default::default(),portable:Default::default()
+        }));
+        let status=json!({"op":"vault.request_status","module":"neebles-connect",
+            "request_id":"deadbeefdeadbeefdeadbeefdeadbeef"});
+        let result=crate::handle(&status,Some("neebles-connect"),&state);
+        assert_eq!(result["ok"],true);
+        assert_eq!(result["data"]["state"],"not_found");
+        assert!(!root.join("vault-neebles-connect.kdbx").exists());
+        std::fs::remove_dir_all(root).unwrap();
     }
     #[test] fn no_secret_is_implicitly_created(){
         assert!(!valid_module("general"));

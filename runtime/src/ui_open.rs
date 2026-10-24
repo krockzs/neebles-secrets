@@ -1,5 +1,7 @@
 //! NEEBLES Secrets governed UI bridge (F16).
 //! This is NOT the Keys daemon. Closing Qt only ends this governed UI session.
+//! F26-A: limited read-only health probe; persistent provider is a separate phase.
+mod boss_health;
 use serde_json::{json, Value};
 use std::fs::{self, File};
 use std::io::{Read, Write};
@@ -43,8 +45,8 @@ fn read_frame<R: Read>(reader: &mut R) -> Result<Value, String> {
     Ok(value)
 }
 fn check_identity(value:&Value,session:&str) -> Result<(),String> {
-    if let Some(module)=value.get("module") {if module.as_str()!=Some(MODULE) {return Err("foreign module".into());}}
-    if let Some(id)=value.get("session_id") {if id.as_str()!=Some(session){return Err("foreign session".into());}}
+    if value.get("module").and_then(Value::as_str)!=Some(MODULE){return Err("missing or foreign module".into());}
+    if value.get("session_id").and_then(Value::as_str)!=Some(session){return Err("missing or foreign session".into());}
     Ok(())
 }
 fn require_message(value:&Value,session:&str,kind:&str) -> Result<(),String> {
@@ -60,18 +62,25 @@ fn session_id()->Result<String,String>{
     for (i,v) in b.iter().enumerate(){if [4,6,8,10].contains(&i){s.push('-');}s.push_str(&format!("{v:02x}"));}
     Ok(s)
 }
-fn module_root()->Result<PathBuf,String>{
+fn eligible_entrypoint(manifest:&Value)->Result<bool,String>{
+    if manifest.get("name").and_then(Value::as_str)!=Some(MODULE)
+        || manifest.get("version").and_then(Value::as_str)!=Some(env!("CARGO_PKG_VERSION")) {
+        return Err("installed Secrets identity mismatch".into());
+    }
+    match manifest.get("entrypoint").and_then(Value::as_str) {
+        Some("runtime/neebles-secrets-ui") => Ok(false), // 1.0.4, legacy governed Qt owner
+        Some("runtime/neebles-secrets") => Ok(true), // future daemon-owned runtime
+        _ => Err("unrecognized Secrets entrypoint".into()),
+    }
+}
+fn module_root()->Result<(PathBuf,bool),String>{
     let exe=std::env::current_exe().map_err(|e|e.to_string())?;
     let runtime=exe.parent().ok_or("runtime parent missing")?;
     let root=runtime.parent().ok_or("module parent missing")?;
     let m:Value=serde_json::from_slice(&fs::read(root.join("manifest.json")).map_err(|e|e.to_string())?)
         .map_err(|e|e.to_string())?;
-    if m.get("name").and_then(Value::as_str)!=Some(MODULE)
-        ||m.get("version").and_then(Value::as_str)!=Some("1.0.4")
-        ||m.get("entrypoint").and_then(Value::as_str)!=Some("runtime/neebles-secrets-ui") {
-        return Err("installed Secrets identity mismatch".into());
-    }
-    Ok(root.to_path_buf())
+    let daemon_owned = eligible_entrypoint(&m)?;
+    Ok((root.to_path_buf(), daemon_owned))
 }
 fn desktop_binary(root:&Path)->Result<PathBuf,String>{
     let p=root.join("bin/neebles-secrets-desktop");
@@ -105,18 +114,48 @@ fn stop_child(child:&mut Child){
     }
     let _=child.kill();let _=child.wait();
 }
+// Legacy Boss `open` claims the runtime session. With daemon-owned runtime,
+// the noncanonical, explicitly declared Surface `show-ui` launches Qt instead.
+// Never allow `open` to manufacture a second owner of modules.runtime.
+fn authorize_intent(args:&[String], daemon_owned:bool)->Result<(),String>{
+    if args.len()!=2 || args[0]!="--intent" {
+        return Err("usage: neebles-secrets-ui --intent open|show-ui".into());
+    }
+    match (daemon_owned,args[1].as_str()) {
+        (false,"open")|(true,"show-ui")=>Ok(()),
+        _=>Err("Secrets UI intent is incompatible with the installed entrypoint".into()),
+    }
+}
 fn run()->Result<(),String>{
     let args:Vec<String>=std::env::args().skip(1).collect();
-    if args.len()!=2||args[0]!="--intent"||args[1]!="open"{return Err("usage: neebles-secrets-ui --intent open".into());}
     if std::env::var("NEEBLES_MODULE").unwrap_or_else(|_|MODULE.into())!=MODULE{return Err("governor module mismatch".into());}
-    let root=module_root()?;
+    let (root,daemon_owned)=module_root()?;
+    authorize_intent(&args,daemon_owned)?;
     desktop_binary(&root)?;
+    if daemon_owned {
+        // Qt is a view, not a second Boss runtime. It may only be launched
+        // through an installed, governed non-`open` lifecycle action.
+        STOP.store(false,Ordering::Relaxed);
+        #[cfg(target_os="linux")]
+        unsafe {signal(15,on_signal);signal(2,on_signal);}
+        let mut qt=spawn_qt(&root)?;
+        let result=loop {
+            if STOP.load(Ordering::Relaxed) { break Ok(()); }
+            match qt.try_wait(){
+                Ok(Some(status)) => break if status.success() {Ok(())} else {Err(format!("Qt exited: {status}"))},
+                Ok(None) => thread::sleep(Duration::from_millis(150)),
+                Err(error) => break Err(format!("Qt status: {error}")),
+            }
+        };
+        stop_child(&mut qt);
+        return result;
+    }
     let session=session_id()?;
     let socket=std::env::var("NEEBLES_MODULES_SOCKET").unwrap_or_else(|_|SOCKET.into());
     if !socket.starts_with('/') {return Err("Boss IPC socket must be absolute".into());}
     let mut writer=UnixStream::connect(&socket).map_err(|e|format!("Boss module IPC unavailable: {e}"))?;
     writer.set_read_timeout(Some(Duration::from_secs(12))).map_err(|e|e.to_string())?;
-    write_frame(&mut writer,&json!({"type":"register","protocol":1,"module":MODULE,"session_id":session,"endpoints":{"commands":[]}}))?;
+    write_frame(&mut writer,&json!({"type":"register","protocol":1,"module":MODULE,"session_id":session,"endpoints":{"commands":[boss_health::ENDPOINT]}}))?;
     let registered=read_frame(&mut writer)?;
     if registered.get("type").and_then(Value::as_str)==Some("error") {
         let details=registered.get("error").and_then(|e|e.get("message"))
@@ -154,6 +193,13 @@ fn run()->Result<(),String>{
             Ok(Ok(msg))=>{
                 if let Err(e)=check_identity(&msg,&session){failure=Some(e);break;}
                 match msg.get("type").and_then(Value::as_str){
+                    Some("invoke")=>{
+                        let response=match boss_health::health_response(&msg,&session){
+                            Ok(response)=>response,
+                            Err(error)=>{failure=Some(error);break;}
+                        };
+                        if let Err(e)=write_frame(&mut writer,&response){failure=Some(e);break;}
+                    },
                     Some("ping")=>{if let Err(e)=write_frame(&mut writer,&json!({"type":"pong","module":MODULE,"session_id":session})){failure=Some(e);break;}},
                     Some("shutdown")=>{
                         if let Err(e)=write_frame(&mut writer,&json!({"type":"shutdown_ack","module":MODULE,"session_id":session})){failure=Some(e);}
@@ -184,6 +230,23 @@ fn main()->ExitCode{
 #[cfg(test)] mod tests{
     use super::*;
     #[test] fn frame_roundtrip(){let mut out=Vec::new();let v=json!({"type":"ping","module":MODULE});write_frame(&mut out,&v).unwrap();assert_eq!(read_frame(&mut out.as_slice()).unwrap(),v);}
-    #[test] fn rejects_foreign_session(){assert!(check_identity(&json!({"module":"other"}),"ok").is_err());assert!(check_identity(&json!({"session_id":"bad"}),"ok").is_err());}
+    #[test] fn rejects_foreign_session(){assert!(check_identity(&json!({"module":"other"}),"ok").is_err());assert!(check_identity(&json!({"session_id":"bad"}),"ok").is_err());assert!(check_identity(&json!({"type":"ping"}),"ok").is_err());}
     #[test] fn uuid_shape(){let s=session_id().unwrap();assert_eq!(s.len(),36);assert_eq!(&s[14..15],"4");}
+    #[test] fn intents_match_only_the_installed_owner_model(){
+        fn intent(s:&str)->Vec<String>{vec!["--intent".to_string(),s.to_string()]}
+        assert!(authorize_intent(&intent("open"),false).is_ok());
+        assert!(authorize_intent(&intent("show-ui"),true).is_ok());
+        assert!(authorize_intent(&intent("open"),true).is_err());
+        assert!(authorize_intent(&intent("show-ui"),false).is_err());
+        assert!(authorize_intent(&intent("unknown"),false).is_err());
+        assert!(authorize_intent(&vec!["--intent".into()],true).is_err());
+    }
+    #[test] fn future_provider_entrypoint_is_distinct_from_legacy_ui_owner(){
+        let old=json!({"name":MODULE,"version":env!("CARGO_PKG_VERSION"),"entrypoint":"runtime/neebles-secrets-ui"});
+        let new=json!({"name":MODULE,"version":env!("CARGO_PKG_VERSION"),"entrypoint":"runtime/neebles-secrets"});
+        assert_eq!(eligible_entrypoint(&old).unwrap(),false);
+        assert_eq!(eligible_entrypoint(&new).unwrap(),true);
+        assert!(eligible_entrypoint(&json!({"name":"foreign","version":env!("CARGO_PKG_VERSION"),"entrypoint":"runtime/neebles-secrets"})).is_err());
+        assert!(eligible_entrypoint(&json!({"name":MODULE,"version":"forged","entrypoint":"runtime/neebles-secrets"})).is_err());
+    }
 }

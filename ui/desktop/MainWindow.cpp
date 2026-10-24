@@ -217,6 +217,12 @@ MainWindow::MainWindow(QString moduleRoot,QWidget* parent):QMainWindow(parent),r
     connect(languageTimer,&QTimer::timeout,this,[this](){reloadLanguage(false);});
     languageTimer->start();
     showView(0);refreshStatus();
+    // Periodic status is asynchronous and has a strict deadline; a stalled
+    // daemon must never block Qt's GUI thread for the IPC read timeout.
+    statusProbeTimer_=new QTimer(this);
+    statusProbeTimer_->setInterval(2500);
+    connect(statusProbeTimer_,&QTimer::timeout,this,[this](){startStatusProbe();});
+    statusProbeTimer_->start();
     // First run prompts for the ONE global master password and creates only vault-general.
     // It NEVER creates vaults on behalf of modules.
     QTimer::singleShot(0,this,[this](){
@@ -228,6 +234,8 @@ MainWindow::MainWindow(QString moduleRoot,QWidget* parent):QMainWindow(parent),r
     });
 }
 MainWindow::~MainWindow(){
+    if(statusProbeTimer_)statusProbeTimer_->stop();
+    cancelStatusProbe();
     if(batchExportCancelFlag_)batchExportCancelFlag_->store(true);
     if(batchExportThread_ && batchExportThread_->isRunning()){
         batchExportThread_->wait(); // Worker checks cancellation between IPC batches.
@@ -322,6 +330,15 @@ void MainWindow::retranslateUi(){
 
 void MainWindow::showView(int index){
     if(index<0||index>=7)return;
+    // The sidebar, dashboard shortcut and programmatic navigation share
+    // this guard. Never enter My Secrets using a cached unlock state.
+    if(index==2){
+        refreshStatus();
+        if(!personalAvailable_){
+            statusBar()->showMessage(translateText(QStringLiteral("Desbloquea Secrets para acceder a My Secrets.")),4000);
+            return;
+        }
+    }
     const QStringList names={QStringLiteral("Dashboard"),QStringLiteral("Quick Secrets"),
         QStringLiteral("My Secrets"),QStringLiteral("Crypto Lab"),
         QStringLiteral("Batch Generator"),QStringLiteral("Batch Exporter"),QStringLiteral("Backup & Restore")};
@@ -333,8 +350,26 @@ void MainWindow::showView(int index){
     views_->setCurrentIndex(index);
     tabs_->setTabText(0,translateText(names[index]));
     for(int i=0;i<navigation_.size();++i)navigation_[i]->setChecked(i==index);
-    if(index==0||index==2)refreshStatus();
+    if(index==0)refreshStatus();
     if(index==2)refreshPersonalList();
+}
+// Disable all entry points to My Secrets and close its view if lock or
+// service loss is detected. Do not navigate through showView(): that would
+// recursively issue another synchronous status request.
+void MainWindow::setPersonalAvailable(bool available){
+    personalAvailable_=available;
+    if(navigation_.size()>2)navigation_[2]->setEnabled(available);
+    if(personalShortcut_)personalShortcut_->setEnabled(available);
+    if(!available){
+        if(personalList_)personalList_->clear();
+        clearPersonalEditor();
+        if(views_ && views_->currentIndex()==2){
+            views_->setCurrentIndex(0);
+            tabs_->setTabText(0,translateText(QStringLiteral("Dashboard")));
+            for(int i=0;i<navigation_.size();++i)
+                navigation_[i]->setChecked(i==0);
+        }
+    }
 }
 void MainWindow::buildDashboard(){
     auto* scroll=new QScrollArea(views_);
@@ -372,6 +407,7 @@ void MainWindow::buildDashboard(){
         auto* action=new QPushButton(items[i],page);
         action->setMinimumHeight(62);
         shortcuts->addWidget(action,i/3,i%3);
+        if(i==1)personalShortcut_=action;
         connect(action,&QPushButton::clicked,this,[this,i](){showView(i+1);});
     }
     layout->addLayout(shortcuts);
@@ -1634,22 +1670,122 @@ void MainWindow::toggleUnlock(){
     refreshStatus();
     if(result.value(QStringLiteral("ok")).toBool())refreshPersonalList();
 }
+// The synchronous path is used for deliberate user actions/navigation only.
+// Cancel any earlier asynchronous response before applying the fresh result.
 void MainWindow::refreshStatus(){
-    QString error;const auto result=call(QJsonObject{{QStringLiteral("op"),QStringLiteral("vault.status")}},&error);
-    if(result.isEmpty()||!result.value(QStringLiteral("ok")).toBool()){
+    cancelStatusProbe();
+    QString error;
+    const auto result=call(QJsonObject{{QStringLiteral("op"),QStringLiteral("vault.status")}},&error);
+    applyStatusResult(result,error);
+}
+
+void MainWindow::cancelStatusProbe(){
+    if(!statusProbeSocket_)return;
+    QLocalSocket* socket=statusProbeSocket_.data();
+    statusProbeSocket_=nullptr;
+    statusProbeBuffer_.clear();
+    QObject::disconnect(socket,nullptr,this,nullptr);
+    socket->abort();
+    socket->deleteLater();
+}
+
+void MainWindow::finishStatusProbe(QLocalSocket* socket,const QJsonObject& response,const QString& error){
+    if(statusProbeSocket_.data()!=socket)return; // late/stale reply
+    cancelStatusProbe();
+    applyStatusResult(response,error);
+}
+
+void MainWindow::startStatusProbe(){
+    if(statusProbeSocket_)return; // only one in-flight request
+    const QString runtime=qEnvironmentVariable("XDG_RUNTIME_DIR");
+    if(runtime.isEmpty()||!QDir::isAbsolutePath(runtime)){
+        applyStatusResult({},QStringLiteral("XDG_RUNTIME_DIR no está definido."));
+        return;
+    }
+    const QByteArray payload=QJsonDocument(QJsonObject{
+        {QStringLiteral("op"),QStringLiteral("vault.status")}
+    }).toJson(QJsonDocument::Compact);
+    QByteArray frame(4,'\0');
+    qToBigEndian<quint32>(static_cast<quint32>(payload.size()),
+                          reinterpret_cast<uchar*>(frame.data()));
+    frame.append(payload);
+    auto* socket=new QLocalSocket(this);
+    statusProbeSocket_=socket;
+    statusProbeBuffer_.clear();
+    connect(socket,&QLocalSocket::connected,this,[this,socket,frame](){
+        if(statusProbeSocket_.data()!=socket)return;
+        if(socket->write(frame)!=frame.size()){
+            finishStatusProbe(socket,{},QStringLiteral("No se pudo enviar vault.status"));
+        }else socket->flush();
+    });
+    connect(socket,&QLocalSocket::readyRead,this,[this,socket](){
+        if(statusProbeSocket_.data()!=socket)return;
+        statusProbeBuffer_.append(socket->readAll());
+        if(statusProbeBuffer_.size()>16388){
+            finishStatusProbe(socket,{},QStringLiteral("Respuesta IPC excede límite"));
+            return;
+        }
+        if(statusProbeBuffer_.size()<4)return;
+        const auto* bytes=reinterpret_cast<const uchar*>(statusProbeBuffer_.constData());
+        const quint32 length=qFromBigEndian<quint32>(bytes);
+        if(length==0||length>16384){
+            finishStatusProbe(socket,{},QStringLiteral("Longitud IPC inválida"));
+            return;
+        }
+        if(statusProbeBuffer_.size()<4+static_cast<int>(length))return;
+        if(statusProbeBuffer_.size()!=4+static_cast<int>(length)){
+            finishStatusProbe(socket,{},QStringLiteral("Respuesta IPC con datos extra"));
+            return;
+        }
+        QJsonParseError parse;
+        const auto doc=QJsonDocument::fromJson(statusProbeBuffer_.mid(4),&parse);
+        if(parse.error!=QJsonParseError::NoError||!doc.isObject()){
+            finishStatusProbe(socket,{},QStringLiteral("JSON IPC inválido"));
+            return;
+        }
+        const auto result=doc.object();
+        const auto data=result.value(QStringLiteral("data")).toObject();
+        if(!result.value(QStringLiteral("ok")).isBool() ||
+           (result.value(QStringLiteral("ok")).toBool() &&
+            (!data.value(QStringLiteral("initialized")).isBool() ||
+             !data.value(QStringLiteral("locked")).isBool()))){
+            finishStatusProbe(socket,{},QStringLiteral("Estado IPC incompleto"));
+            return;
+        }
+        finishStatusProbe(socket,result,QString());
+    });
+    connect(socket,&QLocalSocket::errorOccurred,this,[this,socket](QLocalSocket::LocalSocketError){
+        if(statusProbeSocket_.data()==socket)
+            finishStatusProbe(socket,{},QStringLiteral("Backend Rust no disponible"));
+    });
+    connect(socket,&QLocalSocket::disconnected,this,[this,socket](){
+        if(statusProbeSocket_.data()==socket)
+            finishStatusProbe(socket,{},QStringLiteral("Backend desconectado antes de responder"));
+    });
+    QTimer::singleShot(3000,socket,[this,socket](){
+        if(statusProbeSocket_.data()==socket)
+            finishStatusProbe(socket,{},QStringLiteral("Tiempo de espera agotado en vault.status"));
+    });
+    socket->connectToServer(QDir(runtime).filePath(QStringLiteral("neebles-secrets/secrets.sock")));
+}
+
+// Both synchronous and asynchronous results share exactly one UI state handler.
+void MainWindow::applyStatusResult(const QJsonObject& result,const QString& error){
+    const QJsonObject data=result.value(QStringLiteral("data")).toObject();
+    const bool valid=result.value(QStringLiteral("ok")).toBool() &&
+        data.value(QStringLiteral("initialized")).isBool() &&
+        data.value(QStringLiteral("locked")).isBool();
+    if(!valid){
         status_->setText(translateText(QStringLiteral("● Sin conexión")));unlock_->setEnabled(false);unlock_->setVisible(false);
         if(dashboardService_)dashboardService_->setText(translateText(QStringLiteral("Sin conexión")));
         if(dashboardVault_)dashboardVault_->setText(translateText(QStringLiteral("No disponible")));
         if(dashboardModules_)dashboardModules_->setText(translateText(QStringLiteral("No disponible")));
         if(save_)save_->setEnabled(false);
         if(vaultMessage_)vaultMessage_->setText(QStringLiteral("Backend desconectado. Los Vaults no están disponibles."));
-        if(personalList_)personalList_->clear();
-        clearPersonalEditor();
-        setPersonalEditing(false);
+        setPersonalAvailable(false);
         statusBar()->showMessage(error.isEmpty()?QStringLiteral("Backend desconectado"):error);
         return;
     }
-    const auto data=result.value(QStringLiteral("data")).toObject();
     const bool initialized=data.value(QStringLiteral("initialized")).toBool();
     const bool locked=data.value(QStringLiteral("locked")).toBool();
     status_->setText(translateText(locked?QStringLiteral("● Bloqueado"):QStringLiteral("● Desbloqueado")));
@@ -1661,15 +1797,11 @@ void MainWindow::refreshStatus(){
     unlock_->setVisible(initialized);
     if(save_)save_->setEnabled(initialized&&!locked);
     unlock_->setText(translateText(locked?QStringLiteral("🔒  Desbloquear"):QStringLiteral("🔓  Bloquear")));
-    if(locked){
+    setPersonalAvailable(initialized&&!locked);
+    if(!initialized||locked){
         restoreConfirmation_.clear();restorePreparedNames_.clear();
         if(restoreCommitButton_)restoreCommitButton_->setEnabled(false);
         if(restoreDiscardButton_)restoreDiscardButton_->setEnabled(false);
-        if(personalList_) {
-            personalList_->clear();
-        }
-        clearPersonalEditor();
-        setPersonalEditing(false);
     }
     if(vaultMessage_)vaultMessage_->setText(!initialized?
         QStringLiteral("Configuración inicial pendiente. Solo se creará vault-general.kdbx."):

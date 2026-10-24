@@ -6,6 +6,7 @@
 #include <atomic>
 #include <memory>
 #include <QJsonObject>
+#include <QByteArray>
 #include <QStringList>
 #include <QVector>
 class QCheckBox;
@@ -19,6 +20,8 @@ class QSpinBox;
 class QStackedWidget;
 class QTabWidget;
 class QThread;
+class QLocalSocket;
+class QTimer;
 
 class MainWindow final:public QMainWindow {
 public:
@@ -26,6 +29,11 @@ public:
     ~MainWindow() override;
 private:
     void showView(int index);
+    void setPersonalAvailable(bool available);
+    void startStatusProbe();
+    void cancelStatusProbe();
+    void finishStatusProbe(QLocalSocket* socket,const QJsonObject& response,const QString& error);
+    void applyStatusResult(const QJsonObject& result,const QString& error);
     void buildDashboard();
     void buildQuick();
     void buildCryptoLab();
@@ -66,6 +74,12 @@ private:
     QTabWidget* tabs_=nullptr;
     QStackedWidget* views_=nullptr;
     QVector<QPushButton*> navigation_;
+    QPushButton* personalShortcut_=nullptr;
+    bool personalAvailable_=false;
+    // Event-driven, bounded status observation. Never poll via synchronous call().
+    QPointer<QLocalSocket> statusProbeSocket_;
+    QByteArray statusProbeBuffer_;
+    QTimer* statusProbeTimer_=nullptr;
     QPushButton* unlock_=nullptr;
     QLabel* status_=nullptr;
     QLabel* vaultMessage_=nullptr;

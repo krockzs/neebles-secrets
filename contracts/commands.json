@@ -1,6 +1,52 @@
 {
   "schema": 1,
   "contract": "commands",
-  "endpoints": {},
+  "endpoints": {
+    "health": {
+      "endpoint": "secrets.health.v1",
+      "lifecycle": "runtime",
+      "state_mode": "preserve",
+      "requires_root": false,
+      "metadata": {
+        "data_class": "public_non_sensitive",
+        "status": "persistent_daemon_candidate"
+      }
+    },
+    "vault_exists": {
+      "endpoint": "secrets.vault.exists.v1",
+      "lifecycle": "runtime",
+      "state_mode": "preserve",
+      "requires_root": false,
+      "metadata": {
+        "data_class": "own_vault_metadata",
+        "operation": "read_only",
+        "version": 1
+      }
+    },
+    "vault_request_status": {
+      "endpoint": "secrets.vault.request_status.v1",
+      "lifecycle": "runtime",
+      "state_mode": "preserve",
+      "requires_root": false,
+      "metadata": {
+        "data_class": "own_vault_request_metadata",
+        "operation": "read_only",
+        "version": 1
+      }
+    },
+    "vault_request": {
+      "endpoint": "secrets.vault.request.v1",
+      "lifecycle": "runtime",
+      "state_mode": "preserve",
+      "requires_root": false,
+      "metadata": {
+        "data_class": "own_vault_request_metadata",
+        "operation": "idempotent_mutation",
+        "idempotency_key": "request_id",
+        "reconcile_with": "secrets.vault.request_status.v1",
+        "version": 1
+      }
+    }
+  },
   "metadata": {}
 }

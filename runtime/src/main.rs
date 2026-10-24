@@ -1,6 +1,8 @@
 //! NEEBLES Secrets 1.0.3: brokered IPC, personal KDBX and isolated crypto lab.
 //! No vault is opened, decrypted or written in F10. Never log generated secrets.
 mod vault;
+// F26-L: durable journal for idempotent, scoped vault requests (not publicly advertised).
+mod vault_request_journal;
 mod vault_records;
 mod backup_sessions;
 mod restore_sessions;
@@ -8,6 +10,14 @@ mod restore_sessions;
 mod restore_transaction;
 mod ipc_bridge;
 mod boss_publisher;
+// F26-B: inert until the certified manifest/lifecycle migrates to the daemon entrypoint.
+#[allow(dead_code)]
+mod boss_health;
+#[allow(dead_code)]
+mod boss_runtime;
+mod boss_scope;
+// F26-J: identity-scoped FD handoff to the isolated KDBX worker.
+mod boss_vault_bridge;
 mod crypto_lab;
 mod batch_generator;
 mod portable_exports;
@@ -241,7 +251,7 @@ fn authorize_vault_operation(
         },
         // A consumer can query/create/request only ITS OWN namespaced KDBX.
         // Secrets' desktop is not a consumer and must not impersonate another module.
-        "vault.exists" | "vault.ensure" | "vault.request" => {
+        "vault.exists" | "vault.ensure" | "vault.request" | "vault.request_id" | "vault.request_status" => {
             match (peer, requested_module) {
                 (Some(caller), Some(target))
                     if caller == target && caller != "neebles-secrets" => Ok(()),
@@ -255,7 +265,7 @@ fn authorize_vault_operation(
 // This classification is a defense-in-depth inventory used by regression
 // checks. Per-operation authorization is enforced in handle(), not here.
 fn is_sensitive_operation(op:&str)->bool {
-    matches!(op,"vault.setup"|"vault.unlock"|"vault.lock"|"vault.exists"|"vault.ensure"|"vault.request"
+    matches!(op,"vault.setup"|"vault.unlock"|"vault.lock"|"vault.exists"|"vault.ensure"|"vault.request"|"vault.request_id"|"vault.request_status"
         |"vault.list"|"secret.list"|"secret.put"|"secret.get"|"secret.update"|"secret.delete"
         |"general.list"|"general.get"|"general.put"|"general.update"|"general.delete"|"crypto.compute"|"batch.generate"
         |"backup.catalog"|"backup.open"|"backup.read"|"backup.close"
@@ -276,13 +286,24 @@ fn handle(input: &Value, peer:Option<&str>, state: &Arc<Mutex<VaultController>>)
             if !authorized_personal_peer(peer) {Err("batch_generator_forbidden".into())}
             else {batch_generator::generate_batch(input)}
         },
-        "status"|"vault.status"|"vault.setup"|"vault.unlock"|"vault.lock"|"vault.exists"|"vault.ensure"|"vault.request" => {
+        "status"|"vault.status"|"vault.setup"|"vault.unlock"|"vault.lock"|"vault.exists"|"vault.ensure"|"vault.request"|"vault.request_id"|"vault.request_status" => {
             // Fail closed BEFORE locking VaultController or running any mutation.
             // In particular an anonymous local socket caller cannot lock the UI,
             // select an initial Master Key or provision another module's vault.
             match authorize_vault_operation(op, peer, input.get("module").and_then(Value::as_str)) {
                 Err(error) => Err(error.into()),
-                Ok(()) => match state.lock() {
+                Ok(()) => {
+                    // F26-N: idempotent requests use a minimal worker envelope.
+                    // Reject added password/peer/caller fields before acquiring the vault lock.
+                    let versioned = matches!(op, "vault.request_id" | "vault.request_status");
+                    let envelope_valid = !versioned || input.as_object().is_some_and(|fields| {
+                        fields.len() == 3 && fields.contains_key("op")
+                            && fields.get("module").and_then(Value::as_str).is_some()
+                            && fields.get("request_id").and_then(Value::as_str).is_some()
+                    });
+                    if !envelope_valid {
+                        Err("invalid_vault_request_envelope".into())
+                    } else { match state.lock() {
                     Ok(mut controller)=>match op {
                         "status"|"vault.status"=>controller.status(),
                         "vault.setup"=>controller.setup(input.get("password").and_then(Value::as_str).unwrap_or("")),
@@ -291,10 +312,16 @@ fn handle(input: &Value, peer:Option<&str>, state: &Arc<Mutex<VaultController>>)
                         "vault.exists"=>controller.exists(input.get("module").and_then(Value::as_str).unwrap_or("")),
                         "vault.ensure"=>controller.ensure(input.get("module").and_then(Value::as_str).unwrap_or("")),
                         "vault.request"=>controller.request(input.get("module").and_then(Value::as_str).unwrap_or("")),
+                        "vault.request_id"=>controller.request_with_id(
+                            input.get("module").and_then(Value::as_str).unwrap_or(""),
+                            input.get("request_id").and_then(Value::as_str).unwrap_or("")),
+                        "vault.request_status"=>controller.request_status_with_id(
+                            input.get("module").and_then(Value::as_str).unwrap_or(""),
+                            input.get("request_id").and_then(Value::as_str).unwrap_or("")),
                         _=>Err("unknown_operation".into()),
                     },
                     Err(_)=>Err("vault_state_unavailable".into()),
-                },
+                }}},
             }
         },
         "portable.begin"|"portable.append"|"portable.seal"|"portable.read"|"portable.close" => {
@@ -541,7 +568,9 @@ fn serve_from_certified_world() -> Result<(), String> {
     ).map_err(|_|"invalid installed Secrets manifest")?;
     if data.get("schema").and_then(Value::as_u64) != Some(4)
         || data.get("name").and_then(Value::as_str) != Some("neebles-secrets")
-        || data.get("entrypoint").and_then(Value::as_str) != Some("runtime/neebles-secrets-ui") {
+        || data.get("version").and_then(Value::as_str) != Some(env!("CARGO_PKG_VERSION"))
+        || !matches!(data.get("entrypoint").and_then(Value::as_str),
+            Some("runtime/neebles-secrets-ui" | "runtime/neebles-secrets")) {
         return Err("installed Secrets module identity is invalid".into());
     }
     // Boss already stages and verifies each named module rootfs on publication.
@@ -634,6 +663,20 @@ fn serve_from_certified_world() -> Result<(), String> {
         .spawn(move || boss_publisher::run(publisher_flag))
         .map_err(|e| format!("cannot create Boss publisher worker: {e}"))?;
 
+    // F26-C: a second authenticated Boss socket for the SAME outer daemon PID.
+    // This runtime activates only after a future certified manifest declares
+    // `runtime/neebles-secrets` as entrypoint. The current UI-entrypoint
+    // installation keeps its existing registration path unchanged.
+    // The runtime receives only a cloned endpoint of the anonymous broker FD
+    // channel. No public socket, caller-supplied peer, or KeePass data mount.
+    let provider_control = broker_control.try_clone()
+        .map_err(|e| format!("Secrets provider private FD channel: {e}"))?;
+    let provider_flag = std::sync::Arc::clone(&publishing);
+    let provider = std::thread::Builder::new()
+        .name("secrets-boss-provider".to_string())
+        .spawn(move || boss_runtime::run(provider_flag, provider_control))
+        .map_err(|e| format!("cannot create Secrets provider worker: {e}"))?;
+
     let result = (|| {
         let mut child=cmd.spawn().map_err(|e|format!("cannot enter certified KeePass runtime: {e}"))?;
         let result=broker_loop(&listener,&mut child,&broker_control);
@@ -642,6 +685,7 @@ fn serve_from_certified_world() -> Result<(), String> {
     })();
     publishing.store(false, std::sync::atomic::Ordering::Release);
     let _ = publisher.join();
+    let _ = provider.join();
     // This path is created by the host broker, never the KeePass worker.
     drop(listener);
     let _ = fs::remove_file(&broker_socket_path);

@@ -15,7 +15,9 @@
         "activate-user-service": {
           "artillery": "boss.user_service",
           "objective": "install",
-          "munition": { "resource": "secrets-daemon" },
+          "munition": {
+            "resource": "secrets-daemon"
+          },
           "tactics": {},
           "intelligence": {}
         }
@@ -34,6 +36,19 @@
       "operations": {}
     },
     "open": {
+      "operations": {
+        "launch-ui": {
+          "artillery": "boss.workspace_execution",
+          "objective": "construction.step",
+          "munition": {
+            "step": "open-ui"
+          },
+          "tactics": {},
+          "intelligence": {}
+        }
+      }
+    },
+    "show-ui": {
       "operations": {
         "launch-ui": {
           "artillery": "boss.workspace_execution",
