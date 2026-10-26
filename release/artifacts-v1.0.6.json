@@ -1,0 +1,23 @@
+{
+  "schema": 1,
+  "module": "neebles-secrets",
+  "version": "1.0.6",
+  "compiler": {
+    "rust": "1.98.1",
+    "qt": "6.8.2",
+    "qt_source": "Esbirro controlled sysroot (Bubblewrap)"
+  },
+  "artifacts_sha256": {
+    "runtime/neebles-secrets": "9dd3db281b535ce868d52ce72a0054fda809bebdfcbf75bccf5bcbd5fdacc60b",
+    "runtime/neebles-secrets-ui": "8173a49ae03e1fafb51906c2b174069d1b64c455726d5991bbc1feb2addcea85",
+    "bin/neebles-secrets-desktop": "9770d9daf37c86fd9ef4431a67f614175aee8c52ed2380b5b6d84cc2e9f6fee5"
+  },
+  "commands": {
+    "health": "secrets.health.v1",
+    "vault_exists": "secrets.vault.exists.v1",
+    "vault_request_status": "secrets.vault.request_status.v1",
+    "vault_request": "secrets.vault.request.v1",
+    "structure_capabilities": "secrets.structure.capabilities.v1"
+  },
+  "note": "Rust test/release and controlled Qt DESTDIR candidate; installation, registry and runtime acceptance pending."
+}

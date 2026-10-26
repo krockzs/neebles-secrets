@@ -18,8 +18,14 @@ const POLL: Duration = Duration::from_millis(750);
 
 fn private_flags(master: bool, unlocked: bool) -> BTreeMap<String, String> {
     BTreeMap::from([
-        ("master_key".to_string(), if master {"true"} else {"false"}.to_string()),
-        ("unblock".to_string(), if master && unlocked {"true"} else {"false"}.to_string()),
+        (
+            "master_key".to_string(),
+            if master { "true" } else { "false" }.to_string(),
+        ),
+        (
+            "unblock".to_string(),
+            if master && unlocked { "true" } else { "false" }.to_string(),
+        ),
     ])
 }
 
@@ -35,9 +41,14 @@ fn flags_from_status(reply: &Value) -> BTreeMap<String, String> {
     let installed = data.get("installed").and_then(Value::as_bool) == Some(true);
     let initialized = data.get("initialized").and_then(Value::as_bool) == Some(true);
     let unlocked = data.get("locked").and_then(Value::as_bool) == Some(false);
-    let master = installed && initialized
-        && vars.and_then(|v| v.get("master_key")).and_then(Value::as_str) == Some("true");
-    let unblocked = master && unlocked
+    let master = installed
+        && initialized
+        && vars
+            .and_then(|v| v.get("master_key"))
+            .and_then(Value::as_str)
+            == Some("true");
+    let unblocked = master
+        && unlocked
         && vars.and_then(|v| v.get("unblock")).and_then(Value::as_str) == Some("true");
     private_flags(master, unblocked)
 }
@@ -52,8 +63,10 @@ fn current_flags() -> BTreeMap<String, String> {
 
 fn require_ack(value: &Value, kind: &str, session: &str) -> Result<(), String> {
     if value.get("type").and_then(Value::as_str) == Some("error") {
-        let reason = value.get("error")
-            .and_then(|v| v.get("message")).and_then(Value::as_str)
+        let reason = value
+            .get("error")
+            .and_then(|v| v.get("message"))
+            .and_then(Value::as_str)
             .unwrap_or("Boss rejected service request");
         return Err(format!("Boss publisher rejected: {reason}"));
     }
@@ -61,7 +74,9 @@ fn require_ack(value: &Value, kind: &str, session: &str) -> Result<(), String> {
         || value.get("module").and_then(Value::as_str) != Some(MODULE)
         || value.get("session_id").and_then(Value::as_str) != Some(session)
     {
-        return Err(format!("unexpected Boss publisher response (expected {kind})"));
+        return Err(format!(
+            "unexpected Boss publisher response (expected {kind})"
+        ));
     }
     if kind == "registered" && value.get("protocol").and_then(Value::as_u64) != Some(1) {
         return Err("unsupported Boss publisher protocol".to_string());
@@ -78,40 +93,60 @@ fn exchange(stream: &mut UnixStream, out: &Value, kind: &str, session: &str) -> 
 fn publish_session(alive: &AtomicBool) -> Result<(), String> {
     let mut stream = UnixStream::connect(BOSS_IPC)
         .map_err(|e| format!("Boss module socket unavailable: {e}"))?;
-    stream.set_read_timeout(Some(Duration::from_secs(3)))
+    stream
+        .set_read_timeout(Some(Duration::from_secs(3)))
         .map_err(|e| format!("publisher read timeout: {e}"))?;
-    stream.set_write_timeout(Some(Duration::from_secs(3)))
+    stream
+        .set_write_timeout(Some(Duration::from_secs(3)))
         .map_err(|e| format!("publisher write timeout: {e}"))?;
     let session = super::uuid_v4()?;
-    exchange(&mut stream, &json!({
-        "type":"register_service", "protocol":1, "module":MODULE,
-        "session_id":session, "unit":UNIT
-    }), "registered", &session)?;
+    exchange(
+        &mut stream,
+        &json!({
+            "type":"register_service", "protocol":1, "module":MODULE,
+            "session_id":session, "unit":UNIT
+        }),
+        "registered",
+        &session,
+    )?;
 
     let mut last: Option<BTreeMap<String, String>> = None;
     while alive.load(Ordering::Acquire) {
         let flags = current_flags();
         if last.as_ref() != Some(&flags) {
-            exchange(&mut stream, &json!({
-                "type":"variables_publish", "module":MODULE,
-                "session_id":session, "variables":flags
-            }), "variables_published", &session)?;
+            exchange(
+                &mut stream,
+                &json!({
+                    "type":"variables_publish", "module":MODULE,
+                    "session_id":session, "variables":flags
+                }),
+                "variables_published",
+                &session,
+            )?;
             last = Some(flags);
         }
         // Ping detects Boss restarts even when status has not changed.
-        exchange(&mut stream, &json!({
-            "type":"ping", "module":MODULE, "session_id":session
-        }), "pong", &session)?;
+        exchange(
+            &mut stream,
+            &json!({
+                "type":"ping", "module":MODULE, "session_id":session
+            }),
+            "pong",
+            &session,
+        )?;
         let mut elapsed = Duration::ZERO;
         while elapsed < POLL && alive.load(Ordering::Acquire) {
             thread::sleep(Duration::from_millis(75));
             elapsed += Duration::from_millis(75);
         }
     }
-    let _ = super::rpc_write(&mut stream, &json!({
-        "type":"unregister", "module":MODULE,
-        "session_id":session, "reason":"service_exit"
-    }));
+    let _ = super::rpc_write(
+        &mut stream,
+        &json!({
+            "type":"unregister", "module":MODULE,
+            "session_id":session, "reason":"service_exit"
+        }),
+    );
     Ok(())
 }
 
@@ -129,7 +164,9 @@ pub(super) fn run(alive: Arc<AtomicBool>) {
         }
         // Wait/retry without losing the independent KeePass daemon or Master Key.
         for _ in 0..10 {
-            if !alive.load(Ordering::Acquire) { break; }
+            if !alive.load(Ordering::Acquire) {
+                break;
+            }
             thread::sleep(Duration::from_millis(200));
         }
     }
@@ -141,7 +178,7 @@ mod tests {
     #[test]
     fn missing_or_malformed_status_fails_closed() {
         for value in [json!({}), json!({"ok":false}), json!({"ok":true,"data":{}})] {
-            let vars=flags_from_status(&value);
+            let vars = flags_from_status(&value);
             assert_eq!(vars["master_key"], "false");
             assert_eq!(vars["unblock"], "false");
         }
@@ -152,20 +189,35 @@ mod tests {
             "installed":true,"initialized":true,"locked":false,
             "boss_variables":{"master_key":"true","unblock":"true"}
         }});
-        let vars=flags_from_status(&state);
+        let vars = flags_from_status(&state);
         assert_eq!(vars["master_key"], "true");
         assert_eq!(vars["unblock"], "true");
-        let mut locked=state.clone();
-        locked["data"]["locked"]=json!(true);
+        let mut locked = state.clone();
+        locked["data"]["locked"] = json!(true);
         assert_eq!(flags_from_status(&locked)["unblock"], "false");
-        let mut absent=state.clone();
-        absent["data"]["installed"]=json!(false);
+        let mut absent = state.clone();
+        absent["data"]["installed"] = json!(false);
         assert_eq!(flags_from_status(&absent)["master_key"], "false");
     }
     #[test]
     fn rejects_foreign_or_unexpected_boss_responses() {
-        assert!(require_ack(&json!({"type":"registered","protocol":1,"module":MODULE,"session_id":"ok"}),"registered","ok").is_ok());
-        assert!(require_ack(&json!({"type":"registered","protocol":1,"module":"other","session_id":"ok"}),"registered","ok").is_err());
-        assert!(require_ack(&json!({"type":"pong","module":MODULE,"session_id":"old"}),"pong","ok").is_err());
+        assert!(require_ack(
+            &json!({"type":"registered","protocol":1,"module":MODULE,"session_id":"ok"}),
+            "registered",
+            "ok"
+        )
+        .is_ok());
+        assert!(require_ack(
+            &json!({"type":"registered","protocol":1,"module":"other","session_id":"ok"}),
+            "registered",
+            "ok"
+        )
+        .is_err());
+        assert!(require_ack(
+            &json!({"type":"pong","module":MODULE,"session_id":"old"}),
+            "pong",
+            "ok"
+        )
+        .is_err());
     }
 }

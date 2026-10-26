@@ -19,7 +19,10 @@ const PREFIX: &str = "neebles-fd-v1:";
 const MAX_MODULE: usize = 64;
 
 #[repr(C)]
-struct Iovec { iov_base: *mut c_void, iov_len: usize }
+struct Iovec {
+    iov_base: *mut c_void,
+    iov_len: usize,
+}
 #[repr(C)]
 struct Msghdr {
     msg_name: *mut c_void,
@@ -31,26 +34,42 @@ struct Msghdr {
     msg_flags: i32,
 }
 #[repr(C)]
-struct Cmsghdr { cmsg_len: usize, cmsg_level: i32, cmsg_type: i32 }
+struct Cmsghdr {
+    cmsg_len: usize,
+    cmsg_level: i32,
+    cmsg_type: i32,
+}
 unsafe extern "C" {
     fn sendmsg(fd: i32, msg: *const Msghdr, flags: i32) -> isize;
     fn recvmsg(fd: i32, msg: *mut Msghdr, flags: i32) -> isize;
 }
 
-const fn align(n: usize) -> usize { (n + size_of::<usize>() - 1) & !(size_of::<usize>() - 1) }
+const fn align(n: usize) -> usize {
+    (n + size_of::<usize>() - 1) & !(size_of::<usize>() - 1)
+}
 const CTRL_CAP: usize = align(size_of::<Cmsghdr>()) + align(size_of::<i32>());
 
 fn validate_module(module: &str) -> bool {
     let b = module.as_bytes();
-    !b.is_empty() && b.len() <= MAX_MODULE && b[0].is_ascii_lowercase()
-        && b.iter().all(|x| x.is_ascii_lowercase() || x.is_ascii_digit() || *x == b'-')
-        && !module.ends_with('-') && !module.contains("--")
+    !b.is_empty()
+        && b.len() <= MAX_MODULE
+        && b[0].is_ascii_lowercase()
+        && b.iter()
+            .all(|x| x.is_ascii_lowercase() || x.is_ascii_digit() || *x == b'-')
+        && !module.ends_with('-')
+        && !module.contains("--")
         && module != "general"
 }
 
-pub(crate) fn send_connection(control: &UnixDatagram, client: &UnixStream, peer: Option<&str>) -> Result<(), String> {
+pub(crate) fn send_connection(
+    control: &UnixDatagram,
+    client: &UnixStream,
+    peer: Option<&str>,
+) -> Result<(), String> {
     if let Some(name) = peer {
-        if !validate_module(name) { return Err("invalid_forwarded_peer".into()); }
+        if !validate_module(name) {
+            return Err("invalid_forwarded_peer".into());
+        }
     }
     let mut payload = format!("{PREFIX}{}", peer.unwrap_or("")).into_bytes();
     let fd = client.as_raw_fd();
@@ -60,61 +79,100 @@ pub(crate) fn send_connection(control: &UnixDatagram, client: &UnixStream, peer:
         (*hdr).cmsg_len = align(size_of::<Cmsghdr>()) + size_of::<i32>();
         (*hdr).cmsg_level = SOL_SOCKET;
         (*hdr).cmsg_type = SCM_RIGHTS;
-        ancillary.as_mut_ptr().cast::<u8>().add(align(size_of::<Cmsghdr>()))
-            .cast::<i32>().write_unaligned(fd);
+        ancillary
+            .as_mut_ptr()
+            .cast::<u8>()
+            .add(align(size_of::<Cmsghdr>()))
+            .cast::<i32>()
+            .write_unaligned(fd);
     }
-    let mut iov = Iovec { iov_base: payload.as_mut_ptr().cast(), iov_len: payload.len() };
+    let mut iov = Iovec {
+        iov_base: payload.as_mut_ptr().cast(),
+        iov_len: payload.len(),
+    };
     let hdr = Msghdr {
-        msg_name: std::ptr::null_mut(), msg_namelen: 0,
-        msg_iov: &mut iov, msg_iovlen: 1,
-        msg_control: ancillary.as_mut_ptr().cast(), msg_controllen: CTRL_CAP, msg_flags: 0,
+        msg_name: std::ptr::null_mut(),
+        msg_namelen: 0,
+        msg_iov: &mut iov,
+        msg_iovlen: 1,
+        msg_control: ancillary.as_mut_ptr().cast(),
+        msg_controllen: CTRL_CAP,
+        msg_flags: 0,
     };
     let sent = unsafe { sendmsg(control.as_raw_fd(), &hdr, 0) };
-    if sent < 0 { return Err(format!("private_fd_send: {}", io::Error::last_os_error())); }
-    if sent as usize != payload.len() { return Err("private_fd_short_send".into()); }
+    if sent < 0 {
+        return Err(format!("private_fd_send: {}", io::Error::last_os_error()));
+    }
+    if sent as usize != payload.len() {
+        return Err("private_fd_short_send".into());
+    }
     // Only the kernel-passed descriptor reaches the isolated worker.
     // Neither this function nor the broker reads the RPC content.
     Ok(())
 }
 
-pub(crate) fn recv_connection(control: &UnixDatagram) -> Result<(UnixStream, Option<String>), String> {
+pub(crate) fn recv_connection(
+    control: &UnixDatagram,
+) -> Result<(UnixStream, Option<String>), String> {
     let mut bytes = [0u8; PREFIX.len() + MAX_MODULE];
     let mut ancillary = [0usize; CTRL_CAP / size_of::<usize>()];
-    let mut iov = Iovec { iov_base: bytes.as_mut_ptr().cast(), iov_len: bytes.len() };
+    let mut iov = Iovec {
+        iov_base: bytes.as_mut_ptr().cast(),
+        iov_len: bytes.len(),
+    };
     let mut hdr: Msghdr = unsafe { zeroed() };
     hdr.msg_iov = &mut iov;
     hdr.msg_iovlen = 1;
     hdr.msg_control = ancillary.as_mut_ptr().cast();
     hdr.msg_controllen = CTRL_CAP;
     let received = unsafe { recvmsg(control.as_raw_fd(), &mut hdr, MSG_CMSG_CLOEXEC) };
-    if received < 0 { return Err(format!("private_fd_recv: {}", io::Error::last_os_error())); }
+    if received < 0 {
+        return Err(format!("private_fd_recv: {}", io::Error::last_os_error()));
+    }
     // Own the received FD immediately. An invalid packet must never leak it.
     let mut owned_fd: Option<OwnedFd> = None;
     if hdr.msg_controllen >= align(size_of::<Cmsghdr>()) + size_of::<i32>() {
         let control_hdr = ancillary.as_ptr().cast::<Cmsghdr>();
         let valid = unsafe {
-            (*control_hdr).cmsg_level == SOL_SOCKET && (*control_hdr).cmsg_type == SCM_RIGHTS
+            (*control_hdr).cmsg_level == SOL_SOCKET
+                && (*control_hdr).cmsg_type == SCM_RIGHTS
                 && (*control_hdr).cmsg_len == align(size_of::<Cmsghdr>()) + size_of::<i32>()
         };
         if valid {
             let raw = unsafe {
-                ancillary.as_ptr().cast::<u8>().add(align(size_of::<Cmsghdr>()))
-                    .cast::<i32>().read_unaligned()
+                ancillary
+                    .as_ptr()
+                    .cast::<u8>()
+                    .add(align(size_of::<Cmsghdr>()))
+                    .cast::<i32>()
+                    .read_unaligned()
             };
-            if raw >= 0 { owned_fd = Some(unsafe { OwnedFd::from_raw_fd(raw) }); }
+            if raw >= 0 {
+                owned_fd = Some(unsafe { OwnedFd::from_raw_fd(raw) });
+            }
         }
     }
     if (hdr.msg_flags & (MSG_TRUNC | MSG_CTRUNC)) != 0
-        || received == 0 || received as usize > bytes.len()
-        || hdr.msg_controllen != CTRL_CAP {
+        || received == 0
+        || received as usize > bytes.len()
+        || hdr.msg_controllen != CTRL_CAP
+    {
         return Err("invalid_private_fd_packet".into());
     }
     let fd = owned_fd.ok_or("missing_private_fd")?;
     let data = std::str::from_utf8(&bytes[..received as usize])
         .map_err(|_| "invalid_forwarded_identity_encoding")?;
-    let name = data.strip_prefix(PREFIX).ok_or("invalid_forwarded_identity_version")?;
-    if !name.is_empty() && !validate_module(name) { return Err("invalid_forwarded_identity".into()); }
-    let peer = if name.is_empty() { None } else { Some(name.to_string()) };
+    let name = data
+        .strip_prefix(PREFIX)
+        .ok_or("invalid_forwarded_identity_version")?;
+    if !name.is_empty() && !validate_module(name) {
+        return Err("invalid_forwarded_identity".into());
+    }
+    let peer = if name.is_empty() {
+        None
+    } else {
+        Some(name.to_string())
+    };
     Ok((UnixStream::from(fd), peer))
 }
 
