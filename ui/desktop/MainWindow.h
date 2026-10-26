@@ -1,6 +1,7 @@
 #pragma once
 #include <QMainWindow>
 #include <QPlainTextEdit>
+#include <QByteArray>
 #include <QProgressBar>
 #include <QPointer>
 #include <atomic>
@@ -59,8 +60,9 @@ private:
     void generate();
     void refreshStatus();
     void toggleUnlock();
-    void refreshPersonalList();
+    bool refreshPersonalList();
     void clearPersonalEditor();
+    void clearPersonalClipboard();
     void openPersonalItem(QListWidgetItem* item);
     void savePersonalItem();
     void deletePersonalItem();
@@ -154,4 +156,5 @@ private:
     QPushButton* personalSave_=nullptr;
     QPushButton* personalEdit_=nullptr;
     QString personalId_;
+    QByteArray personalClipboardDigest_;
 };

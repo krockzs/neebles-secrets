@@ -57,7 +57,7 @@ def verified_installed() -> bytes:
     """Do not trust arbitrary systemd snippets from an unverified path."""
     manifest = json.loads(require_real_file(MANIFEST))
     if (manifest.get('schema') != 4 or manifest.get('name') != MODULE
-            or manifest.get('entrypoint') != 'runtime/neebles-secrets-ui'):
+            or manifest.get('entrypoint') != 'runtime/neebles-secrets'):
         raise RuntimeError('installed Secrets module manifest identity mismatch')
     extras = manifest.get('uninstall', {}).get('extras', [])
     expected = [item for item in extras if item.get('id') == 'secrets-daemon']

@@ -30,4 +30,12 @@ if(NEEBLES_SECRETS_BUILD_TESTS)
     target_compile_options(neebles-secrets-single-instance-test PRIVATE -Wall -Wextra -Wpedantic)
     add_test(NAME neebles-secrets-single-instance COMMAND neebles-secrets-single-instance-test)
     set_tests_properties(neebles-secrets-single-instance PROPERTIES TIMEOUT 15)
+
+    # Stage 5 test is run through the QA harness that starts its private IPC fixture.
+    add_executable(neebles-secrets-ui-lock-test
+        tests/SecretsLockUiTest.cpp MainWindow.cpp MainWindow.h
+        BackupIpc.cpp BackupIpc.h PortableExportIpc.cpp PortableExportIpc.h)
+    target_link_libraries(neebles-secrets-ui-lock-test PRIVATE Qt6::Widgets Qt6::Network)
+    target_compile_options(neebles-secrets-ui-lock-test PRIVATE -Wall -Wextra -Wpedantic)
+
 endif()

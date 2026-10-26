@@ -1,0 +1,23 @@
+{
+  "schema": 1,
+  "module": "neebles-secrets",
+  "version": "1.0.5",
+  "compiler": {
+    "rust": "1.98.1",
+    "qt": "6.8.2",
+    "qt_source": "Esbirro controlled sysroot"
+  },
+  "artifacts_sha256": {
+    "runtime/neebles-secrets": "e26ed77f2463ad8c2d3977f9016b94c1d3b2c026dcac083ea4a74f7883e2f413",
+    "runtime/neebles-secrets-ui": "024f2bc082e489929675cb6fb5e88d2db4fbe3b081259dfd26d664974ce365b7",
+    "bin/neebles-secrets-desktop": "47a3b1ebfdba48c94828512a255ce768fcb6d33d4870845a38fa84bb8f6471f2"
+  },
+  "commands": {
+    "health": "secrets.health.v1",
+    "vault_exists": "secrets.vault.exists.v1",
+    "vault_request_status": "secrets.vault.request_status.v1",
+    "vault_request": "secrets.vault.request.v1",
+    "structure_capabilities": "secrets.structure.capabilities.v1"
+  },
+  "note": "Built and certified in source repository. Not installed."
+}

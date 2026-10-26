@@ -46,6 +46,20 @@
         "reconcile_with": "secrets.vault.request_status.v1",
         "version": 1
       }
+    },
+    "structure_capabilities": {
+      "endpoint": "secrets.structure.capabilities.v1",
+      "lifecycle": "runtime",
+      "state_mode": "preserve",
+      "requires_root": false,
+      "metadata": {
+        "data_class": "own_vault_non_sensitive_metadata",
+        "operation": "read_only",
+        "control_plane": "boss",
+        "data_plane": "private_so_peercred",
+        "returns_secret_values": false,
+        "version": 1
+      }
     }
   },
   "metadata": {}

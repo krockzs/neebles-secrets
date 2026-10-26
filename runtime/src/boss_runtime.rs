@@ -107,6 +107,8 @@ fn handle_message(msg: &Value, session: &str) -> Result<(Option<Value>, bool), S
                 super::boss_vault_bridge::authorized_request_status(msg,session,None)?
              } else if endpoint == Some(super::boss_vault_bridge::REQUEST_ENDPOINT) {
                 super::boss_vault_bridge::authorized_request(msg,session,None)?
+            } else if endpoint == Some(super::boss_structure_bridge::ENDPOINT) {
+                super::boss_structure_bridge::authorized_capabilities(msg,session,None)?
             } else if endpoint == Some("secrets.vault.exists.v1") {
                 super::boss_scope::staged_vault_reply(msg, session)?
             } else {
@@ -132,7 +134,7 @@ fn session_at(socket: &Path, alive: &AtomicBool, broker_control: Option<&UnixDat
     let id = super::uuid_v4()?;
     super::rpc_write(&mut stream, &json!({
         "type":"register", "protocol":1, "module":MODULE, "session_id":id,
-        "endpoints":{"commands":[super::boss_health::ENDPOINT,super::boss_vault_bridge::ENDPOINT,super::boss_vault_bridge::STATUS_ENDPOINT,super::boss_vault_bridge::REQUEST_ENDPOINT]}
+        "endpoints":{"commands":[super::boss_health::ENDPOINT,super::boss_vault_bridge::ENDPOINT,super::boss_vault_bridge::STATUS_ENDPOINT,super::boss_vault_bridge::REQUEST_ENDPOINT,super::boss_structure_bridge::ENDPOINT]}
     }))?;
     let reply = read_message(&mut stream, alive)?.ok_or("Provider interrupted before registration")?;
     verify_boss(&reply, "registered", &id)?;
@@ -156,6 +158,10 @@ fn session_at(socket: &Path, alive: &AtomicBool, broker_control: Option<&UnixDat
             && msg.get("endpoint").and_then(Value::as_str) == Some(super::boss_vault_bridge::REQUEST_ENDPOINT)
         {
             (Some(super::boss_vault_bridge::authorized_request(&msg,&id,broker_control)?),false)
+        } else if msg.get("type").and_then(Value::as_str) == Some("invoke")
+            && msg.get("endpoint").and_then(Value::as_str) == Some(super::boss_structure_bridge::ENDPOINT)
+        {
+            (Some(super::boss_structure_bridge::authorized_capabilities(&msg,&id,broker_control)?),false)
         } else { handle_message(&msg, &id)? };
         if let Some(reply) = reply { super::rpc_write(&mut stream, &reply)?; }
         if shutdown { return Ok(SessionEnd::Shutdown); }
@@ -267,7 +273,7 @@ mod tests {
         assert_eq!(register["type"], "register");
         assert_eq!(register["protocol"], 1);
         assert_eq!(register["module"], MODULE);
-        assert_eq!(register["endpoints"]["commands"], json!(["secrets.health.v1", "secrets.vault.exists.v1", "secrets.vault.request_status.v1", "secrets.vault.request.v1"]));
+        assert_eq!(register["endpoints"]["commands"], json!(["secrets.health.v1", "secrets.vault.exists.v1", "secrets.vault.request_status.v1", "secrets.vault.request.v1", "secrets.structure.capabilities.v1"]));
         let id = register["session_id"].as_str().unwrap();
         assert!(!id.is_empty());
         let identity = id.to_owned();
@@ -358,7 +364,7 @@ fn boss_mock_vault_exists_roundtrip_uses_scoped_worker_fd() {
     wire.set_write_timeout(Some(Duration::from_secs(5))).unwrap();
     let registration = crate::rpc_read(&mut wire).unwrap();
     assert_eq!(registration["endpoints"]["commands"],
-        json!(["secrets.health.v1", "secrets.vault.exists.v1", "secrets.vault.request_status.v1", "secrets.vault.request.v1"]));
+        json!(["secrets.health.v1", "secrets.vault.exists.v1", "secrets.vault.request_status.v1", "secrets.vault.request.v1", "secrets.structure.capabilities.v1"]));
     let id = registration["session_id"].as_str().unwrap().to_string();
     crate::rpc_write(&mut wire, &json!({
         "type":"registered","protocol":1,"module":MODULE,"session_id":id
@@ -505,7 +511,7 @@ fn boss_mock_durable_write_once_and_reconciliation_are_distinct_operations() {
     wire.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
     wire.set_write_timeout(Some(Duration::from_secs(5))).unwrap();
     let registration=crate::rpc_read(&mut wire).unwrap();
-    assert_eq!(registration["endpoints"]["commands"].as_array().unwrap().len(),4);
+    assert_eq!(registration["endpoints"]["commands"].as_array().unwrap().len(),5);
     let id=registration["session_id"].as_str().unwrap().to_string();
     crate::rpc_write(&mut wire,&json!({"type":"registered","protocol":1,"module":MODULE,"session_id":id})).unwrap();
     for (endpoint,result) in [
@@ -597,7 +603,7 @@ fn boss_mock_durable_write_once_and_reconciliation_are_distinct_operations() {
         let register = crate::rpc_read(&mut wire).unwrap();
         assert_eq!(register["type"], "register");
         assert_eq!(register["module"], MODULE);
-        assert_eq!(register["endpoints"]["commands"].as_array().unwrap().len(), 4);
+        assert_eq!(register["endpoints"]["commands"].as_array().unwrap().len(), 5);
         let session = register["session_id"].as_str().unwrap().to_owned();
         crate::rpc_write(&mut wire, &json!({
             "type":"registered", "protocol":1, "module":MODULE, "session_id":session

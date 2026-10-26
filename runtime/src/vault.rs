@@ -630,6 +630,47 @@ impl VaultController {
     pub fn secret_delete(&self,module:&str,id:&str)->Result<Value,String>{
         self.with_module_vault(module,|p,k|crate::vault_records::delete(p,k,id))
     }
+    // Schema/record access inherits the same authenticated module-vault
+    // boundary used by the legacy secret CRUD. No new plaintext storage.
+    pub fn structure_define(&self,module:&str,def:&Value)->Result<Value,String>{
+        self.with_module_vault(module,|p,k|{
+            let mut db=crate::structured_records::Encrypted::new(p,k);
+            crate::structured_records::define(&mut db,def)
+        })
+    }
+    pub fn structure_schema_get(&self,module:&str,id:&str)->Result<Value,String>{
+        self.with_module_vault(module,|p,k|{
+            let db=crate::structured_records::Encrypted::new(p,k);
+            crate::structured_records::get_schema(&db,id)
+        })
+    }
+    pub fn structure_put(&self,module:&str,schema:&str,id:&str,value:&Value,revision:Option<u64>)->Result<Value,String>{
+        self.with_module_vault(module,|p,k|{
+            let mut db=crate::structured_records::Encrypted::new(p,k);
+            crate::structured_records::put(&mut db,schema,id,value,revision)
+        })
+    }
+    pub fn structure_get(&self,module:&str,schema:&str,id:&str)->Result<Value,String>{
+        self.with_module_vault(module,|p,k|{
+            let db=crate::structured_records::Encrypted::new(p,k);
+            crate::structured_records::get(&db,schema,id)
+        })
+    }
+    pub fn structure_list(&self,module:&str,schema:&str,cursor:Option<&str>,limit:u64)->Result<Value,String>{
+        self.with_module_vault(module,|p,k|{
+            let db=crate::structured_records::Encrypted::new(p,k);
+            crate::structured_records::list(&db,schema,cursor,limit)
+        })
+    }
+    pub fn structure_batch(&self,module:&str,operations:&Value)->Result<Value,String>{
+        self.with_module_vault(module,|p,k|crate::structured_records::encrypted_batch(p,k,operations))
+    }
+    pub fn structure_delete(&self,module:&str,schema:&str,id:&str,revision:u64)->Result<Value,String>{
+        self.with_module_vault(module,|p,k|{
+            let mut db=crate::structured_records::Encrypted::new(p,k);
+            crate::structured_records::delete(&mut db,schema,id,revision)
+        })
+    }
     pub fn ensure(&mut self,module:&str)->Result<Value,String>{
         if !valid_module(module) {return Err("invalid_module_id".into());}
         let master=self.unlocked.as_ref().ok_or("vault_locked")?;
@@ -652,6 +693,103 @@ impl VaultController {
     // Rust tests inside the disposable keepass-full Bubblewrap world. They
     // exercise actual KeePassXC/KDBX, not the fake-byte recovery fixtures.
     // The Python harness mounts no host HOME, /opt, or Boss IPC socket.
+    #[test]
+    #[ignore = "disposable keepass-full Bubblewrap world only"]
+    fn sprint_real_chunked_structured_values_encrypted_and_reversible(){
+        let (_scratch,dir)=f26v_paths();
+        let password=f26v_random_key();
+        let module="neebles-connect";
+        let mut controller=VaultController::new().unwrap();
+        controller.setup(&password).unwrap();
+        controller.ensure(module).unwrap();
+        let path=dir.join(format!("vault-{module}.kdbx"));
+        let schema=json!({"id":"asset","version":1,"require_replica":true,
+            "fields":{"description":{"type":"secret","max_length":96000,"required":true}}});
+        controller.structure_define(module,&schema).unwrap();
+        let secret="SAFE_TEST_DATA_".repeat(1500); // >8 KiB physical record
+        controller.structure_put(module,"asset","big",&json!({"description":secret}),None).unwrap();
+        let ciphertext=fs::read(&path).unwrap();
+        assert!(!ciphertext.windows(15).any(|w|w==b"SAFE_TEST_DATA_"));
+        assert_eq!(controller.structure_get(module,"asset","big").unwrap()["value"]["description"],secret);
+        drop(controller);
+        let mut again=VaultController::new().unwrap();
+        again.unlock(&password).unwrap();
+        assert_eq!(again.structure_get(module,"asset","big").unwrap()["value"]["description"],secret);
+        again.structure_put(module,"asset","big",&json!({"description":"short"}),Some(1)).unwrap();
+        assert_eq!(again.structure_get(module,"asset","big").unwrap()["value"]["description"],"short");
+        let before=fs::read(&path).unwrap();
+        let denied=again.structure_put(module,"asset","big",&json!({"description":"invalid"}),Some(1));
+        assert!(denied.is_err());
+        assert_eq!(fs::read(&path).unwrap(),before);
+        again.structure_delete(module,"asset","big",2).unwrap();
+        assert!(again.structure_get(module,"asset","big").is_err());
+    }
+    #[test]
+    #[ignore = "requires disposable keepass-full Bubblewrap world"]
+    fn sprint_real_structured_kdbx_crud_restart() {
+        let (_root, folder)=f26v_paths();
+        let password=f26v_random_key();
+        let mut controller=VaultController::new().unwrap();
+        controller.setup(&password).unwrap();
+        controller.ensure("neebles-connect").unwrap();
+        let node_schema=json!({"id":"node","version":1,"require_replica":true,
+            "fields":{"name":{"type":"string","required":true},"host":{"type":"string","required":true}},
+            "unique":[["name"]]});
+        let vscode_schema=json!({"id":"vscode","version":1,"require_replica":true,
+            "fields":{"node":{"type":"reference","target_schema":"node","required":true},
+              "port":{"type":"integer","required":true},"password":{"type":"secret"}},
+            "unique":[["node","port"]]});
+        controller.structure_define("neebles-connect",&node_schema).unwrap();
+        controller.structure_define("neebles-connect",&vscode_schema).unwrap();
+        controller.structure_put("neebles-connect","node","host1",
+            &json!({"name":"Computer","host":"192.0.2.1"}),None).unwrap();
+        controller.structure_put("neebles-connect","vscode","instance1",
+            &json!({"node":"host1","port":8081,"password":"disposable-secret"}),None).unwrap();
+        let encrypted=folder.join("vault-neebles-connect.kdbx");
+        db_verify(&encrypted,password.as_bytes()).unwrap();
+        drop(controller);
+        let mut controller=VaultController::new().unwrap();
+        assert!(controller.structure_get("neebles-connect","node","host1").is_err());
+        controller.unlock(&password).unwrap();
+        let fetched=controller.structure_get("neebles-connect","vscode","instance1").unwrap();
+        assert_eq!(fetched["value"]["password"],"disposable-secret");
+        assert_eq!(fetched["revision"],1);
+        assert_eq!(controller.structure_list("neebles-connect","vscode",None,10).unwrap()["ids"],json!(["instance1"]));
+        assert_eq!(controller.structure_put("neebles-connect","vscode","duplicate",
+            &json!({"node":"host1","port":8081}),None).unwrap_err(),"unique_constraint_violation");
+        assert_eq!(controller.structure_delete("neebles-connect","node","host1",1).unwrap_err(),"entity_referenced");
+        controller.structure_delete("neebles-connect","vscode","instance1",1).unwrap();
+        controller.structure_delete("neebles-connect","node","host1",1).unwrap();
+    }
+    #[test]
+    #[ignore = "requires disposable keepass-full Bubblewrap world"]
+    fn sprint_real_atomic_structured_batch_and_migration(){
+        let (_root, folder)=f26v_paths();
+        let password=f26v_random_key();
+        let mut controller=VaultController::new().unwrap();
+        controller.setup(&password).unwrap();
+        controller.ensure("neebles-connect").unwrap();
+        let schema=json!({"id":"node","version":1,"require_replica":true,
+            "fields":{"name":{"type":"string","required":true},"host":{"type":"string","required":true}}});
+        let first=json!([
+            {"op":"define","schema":schema},
+            {"op":"put","schema_id":"node","id":"first","value":{"name":"lab","host":"localhost"}}
+        ]);
+        assert_eq!(controller.structure_batch("neebles-connect",&first).unwrap()["committed"],true);
+        let path=folder.join("vault-neebles-connect.kdbx");
+        let before=std::fs::read(&path).unwrap();
+        let invalid=json!([
+            {"op":"put","schema_id":"node","id":"second","value":{"name":"other","host":"localhost"}},
+            {"op":"put","schema_id":"node","id":"third","value":{"name":"missing-host"}}
+        ]);
+        assert_eq!(controller.structure_batch("neebles-connect",&invalid).unwrap_err(),"missing_required_field");
+        assert_eq!(std::fs::read(&path).unwrap(),before,"failed batch altered encrypted vault");
+        let mut next=schema.clone();next["version"]=json!(2);
+        next["fields"]["enabled"]=json!({"type":"boolean","required":true,"default":true});
+        assert_eq!(controller.structure_batch("neebles-connect",&json!([{"op":"migrate","schema":next}])).unwrap()["results"][0]["migrated"],1);
+        assert_eq!(controller.structure_get("neebles-connect","node","first").unwrap()["value"]["enabled"],true);
+        db_verify(&path,password.as_bytes()).unwrap();
+    }
     fn f26v_random_key()->String {
         let mut entropy=[0u8;32];
         File::open("/dev/urandom").unwrap().read_exact(&mut entropy).unwrap();
@@ -1237,6 +1375,11 @@ mod f16_rpc_transport_qa {
     #[test]
     fn f16_public_status_and_ephemeral_quick_generator_stay_available() {
         let (state,path)=fixture();
+        // Runtime construction guarantees an owned 0700 vault directory.
+        // F16 predates that invariant; make the disposable fixture realistic
+        // instead of weakening F26-R's fail-closed filesystem validation.
+        fs::create_dir(&path).expect("isolated F16 vault test directory");
+        fs::set_permissions(&path,fs::Permissions::from_mode(0o700)).unwrap();
         let status=rpc(&state,None,json!({"op":"status"}));
         assert_eq!(status["ok"],true,"{status}");
         assert_eq!(status["data"]["initialized"],false);
@@ -1245,6 +1388,9 @@ mod f16_rpc_transport_qa {
         assert_eq!(quick["ok"],true,"quick generation failed");
         assert_eq!(quick["data"]["stored"],false);
         assert_eq!(quick["data"]["value"].as_str().unwrap().len(),20);
+        assert_eq!(fs::read_dir(&path).unwrap().count(),0,
+            "status and Quick must not persist data in the vault directory");
+        fs::remove_dir(&path).expect("remove empty F16 fixture");
         assert!(!path.exists());
     }
 }

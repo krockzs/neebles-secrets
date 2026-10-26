@@ -4,6 +4,8 @@ mod vault;
 // F26-L: durable journal for idempotent, scoped vault requests (not publicly advertised).
 mod vault_request_journal;
 mod vault_records;
+// Private, module-scoped structured KDBX engine (not yet a Boss command contract).
+mod structured_records;
 mod backup_sessions;
 mod restore_sessions;
 #[allow(dead_code)]
@@ -18,6 +20,8 @@ mod boss_runtime;
 mod boss_scope;
 // F26-J: identity-scoped FD handoff to the isolated KDBX worker.
 mod boss_vault_bridge;
+// Boss-governed metadata only; structured records never travel in its jobs.
+mod boss_structure_bridge;
 mod crypto_lab;
 mod batch_generator;
 mod portable_exports;
@@ -36,7 +40,11 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, ExitCode};
 use std::time::Duration;
 
-const MAX_FRAME: usize = 16 * 1024;
+// Bound each authenticated private frame. Large structured documents are
+// stored in protected KDBX chunks, never carried through Boss job results.
+// This is not an unrestricted stream; higher-capacity cursor/chunk sessions
+// require separate resource budgeting before being exposed publicly.
+const MAX_FRAME: usize = 160 * 1024;
 const MAX_PASSWORD: usize = 512;
 const MAX_RANDOM_BYTES: usize = 512;
 
@@ -267,6 +275,7 @@ fn authorize_vault_operation(
 fn is_sensitive_operation(op:&str)->bool {
     matches!(op,"vault.setup"|"vault.unlock"|"vault.lock"|"vault.exists"|"vault.ensure"|"vault.request"|"vault.request_id"|"vault.request_status"
         |"vault.list"|"secret.list"|"secret.put"|"secret.get"|"secret.update"|"secret.delete"
+        |"structure.schema_define"|"structure.schema_get"|"structure.put"|"structure.get"|"structure.list"|"structure.delete"
         |"general.list"|"general.get"|"general.put"|"general.update"|"general.delete"|"crypto.compute"|"batch.generate"
         |"backup.catalog"|"backup.open"|"backup.read"|"backup.close"
         |"portable.begin"|"portable.append"|"portable.seal"|"portable.read"|"portable.close"
@@ -392,6 +401,50 @@ fn handle(input: &Value, peer:Option<&str>, state: &Arc<Mutex<VaultController>>)
                         "restore.commit"=>controller.restore_commit(
                             input.get("confirmation").and_then(Value::as_str).unwrap_or("")),
                         _=>Err("unknown_operation".into())
+                    },
+                    Err(_)=>Err("vault_state_unavailable".into()),
+                }
+            }
+        },
+        // Generic schemas are carried over the existing *private*, peer-authenticated
+        // broker. Boss capabilities are NOT advertised until grants and transport
+        // limits have been certified. A JSON module value never authorizes access.
+        "structure.schema_define"|"structure.schema_get"|"structure.put"|"structure.get"|"structure.list"|"structure.delete"|"structure.batch" => {
+            let module=input.get("module").and_then(Value::as_str).unwrap_or("");
+            let allowed=match op {
+                "structure.schema_define" => &["op","module","schema"][..],
+                "structure.batch" => &["op","module","operations"][..],
+                "structure.schema_get" => &["op","module","schema_id"][..],
+                "structure.put" => &["op","module","schema_id","id","value","expected_revision"][..],
+                "structure.get" => &["op","module","schema_id","id"][..],
+                "structure.list" => &["op","module","schema_id","cursor","limit"][..],
+                _ => &["op","module","schema_id","id","expected_revision"][..],
+            };
+            if peer!=Some(module) || module=="neebles-secrets" {
+                Err("structure_module_identity_mismatch".into())
+            } else if !input.as_object().is_some_and(|fields| fields.keys().all(|k|allowed.contains(&k.as_str()))) {
+                Err("invalid_structure_envelope".into())
+            } else {
+                match state.lock() {
+                    Ok(controller)=>{
+                        let schema_id=input.get("schema_id").and_then(Value::as_str).unwrap_or("");
+                        let id=input.get("id").and_then(Value::as_str).unwrap_or("");
+                        match op {
+                            "structure.schema_define" => controller.structure_define(module,input.get("schema").unwrap_or(&Value::Null)),
+                            "structure.batch" => controller.structure_batch(module,input.get("operations").unwrap_or(&Value::Null)),
+                            "structure.schema_get" => controller.structure_schema_get(module,schema_id),
+                            "structure.put" => match input.get("value") {
+                                Some(value) => controller.structure_put(module,schema_id,id,value,input.get("expected_revision").and_then(Value::as_u64)),
+                                None => Err("missing_structure_value".into()),
+                            },
+                            "structure.get" => controller.structure_get(module,schema_id,id),
+                            "structure.list" => controller.structure_list(module,schema_id,input.get("cursor").and_then(Value::as_str),input.get("limit").and_then(Value::as_u64).unwrap_or(50)),
+                            "structure.delete" => match input.get("expected_revision").and_then(Value::as_u64) {
+                                Some(revision) => controller.structure_delete(module,schema_id,id,revision),
+                                None => Err("missing_expected_revision".into()),
+                            },
+                            _=>Err("unknown_operation".into()),
+                        }
                     },
                     Err(_)=>Err("vault_state_unavailable".into()),
                 }

@@ -142,7 +142,7 @@ static bool askMasterKey(QWidget* parent, bool setup, QString* output,
 }
 }
 MainWindow::MainWindow(QString moduleRoot,QWidget* parent):QMainWindow(parent),root_(std::move(moduleRoot)){
-    setWindowTitle(QStringLiteral("N.E.E.B.L.E.S. Secrets — 1.0.4"));
+    setWindowTitle(QStringLiteral("N.E.E.B.L.E.S. Secrets — 1.0.5"));
     setWindowIcon(QIcon(QDir(root_).filePath(QStringLiteral("assets/neebles-secrets-icon.png"))));
     setMinimumSize(1040,650);resize(1400,850);
     setStyleSheet(QStringLiteral(R"QSS(
@@ -196,7 +196,7 @@ MainWindow::MainWindow(QString moduleRoot,QWidget* parent):QMainWindow(parent),r
     unlock_->setObjectName(QStringLiteral("unlockButton"));
     unlock_->setVisible(false); // never show before vault-general exists
     left->addWidget(unlock_);
-    left->addWidget(note(QStringLiteral("Secrets v1.0.4"),sidebar));
+    left->addWidget(note(QStringLiteral("Secrets v1.0.5"),sidebar));
     row->addWidget(sidebar);
     auto* right=new QWidget(root);auto* rightLayout=new QVBoxLayout(right);
     auto* header=new QHBoxLayout();
@@ -234,6 +234,7 @@ MainWindow::MainWindow(QString moduleRoot,QWidget* parent):QMainWindow(parent),r
     });
 }
 MainWindow::~MainWindow(){
+    clearPersonalClipboard();
     if(statusProbeTimer_)statusProbeTimer_->stop();
     cancelStatusProbe();
     if(batchExportCancelFlag_)batchExportCancelFlag_->store(true);
@@ -334,7 +335,11 @@ void MainWindow::showView(int index){
     // this guard. Never enter My Secrets using a cached unlock state.
     if(index==2){
         refreshStatus();
-        if(!personalAvailable_){
+        // A sidebar click toggles its own check state before this handler.
+        // If authorization is denied, preserve the selection of the visible page.
+        if(!personalAvailable_ || !refreshPersonalList() || !personalAvailable_){
+            for(int i=0;i<navigation_.size();++i)
+                navigation_[i]->setChecked(i==views_->currentIndex());
             statusBar()->showMessage(translateText(QStringLiteral("Desbloquea Secrets para acceder a My Secrets.")),4000);
             return;
         }
@@ -351,16 +356,18 @@ void MainWindow::showView(int index){
     tabs_->setTabText(0,translateText(names[index]));
     for(int i=0;i<navigation_.size();++i)navigation_[i]->setChecked(i==index);
     if(index==0)refreshStatus();
-    if(index==2)refreshPersonalList();
 }
 // Disable all entry points to My Secrets and close its view if lock or
 // service loss is detected. Do not navigate through showView(): that would
 // recursively issue another synchronous status request.
 void MainWindow::setPersonalAvailable(bool available){
     personalAvailable_=available;
+    // Sidebar and Dashboard access are guarded; do not toggle enabled state
+    // of the whole stacked page while Qt processes a navigation event.
     if(navigation_.size()>2)navigation_[2]->setEnabled(available);
     if(personalShortcut_)personalShortcut_->setEnabled(available);
     if(!available){
+        clearPersonalClipboard();
         if(personalList_)personalList_->clear();
         clearPersonalEditor();
         if(views_ && views_->currentIndex()==2){
@@ -370,6 +377,19 @@ void MainWindow::setPersonalAvailable(bool available){
                 navigation_[i]->setChecked(i==0);
         }
     }
+}
+// Only remove a clipboard value if Secrets itself copied it and the value
+// has not since been replaced by another application. Never retain a second
+// plaintext copy of a personal secret in the desktop controller.
+void MainWindow::clearPersonalClipboard(){
+    if(personalClipboardDigest_.isEmpty())return;
+    auto* clipboard=QApplication::clipboard();
+    if(clipboard){
+        const auto current=QCryptographicHash::hash(
+            clipboard->text(QClipboard::Clipboard).toUtf8(),QCryptographicHash::Sha256);
+        if(current==personalClipboardDigest_)clipboard->clear(QClipboard::Clipboard);
+    }
+    personalClipboardDigest_.clear();
 }
 void MainWindow::buildDashboard(){
     auto* scroll=new QScrollArea(views_);
@@ -1411,6 +1431,7 @@ void MainWindow::buildVaults(){
     personalFilter_=new QLineEdit(listCard);
     personalFilter_->setPlaceholderText(QStringLiteral("Buscar secretos por nombre o identificador"));
     personalList_=new QListWidget(listCard);
+    personalList_->setObjectName(QStringLiteral("secretsPersonalList"));
     left->addWidget(personalFilter_);left->addWidget(personalList_,1);
     body->addWidget(listCard,4);
     auto* editorCard=new QFrame(page);editorCard->setObjectName(QStringLiteral("panelCard"));
@@ -1428,6 +1449,7 @@ void MainWindow::buildVaults(){
     personalTags_=new QLineEdit(editorCard);personalTags_->setMaxLength(500);
     personalTags_->setPlaceholderText(QStringLiteral("Etiquetas separadas por comas"));
     personalContent_=new QLineEdit(editorCard);
+    personalContent_->setObjectName(QStringLiteral("secretsPersonalContent"));
     personalContent_->setEchoMode(QLineEdit::Password);
     personalContent_->setPlaceholderText(QStringLiteral("Contenido protegido (máx. 4096 caracteres)"));
     personalReveal_=new QCheckBox(QStringLiteral("Revelar"),editorCard);
@@ -1440,6 +1462,7 @@ void MainWindow::buildVaults(){
     personalEdit_=new QPushButton(QStringLiteral("Editar"),editorCard);
     personalSave_=new QPushButton(QStringLiteral("Guardar cambios"),editorCard);
     auto* copy=new QPushButton(QStringLiteral("Copiar"),editorCard);
+    copy->setObjectName(QStringLiteral("secretsPersonalCopy"));
     auto* erase=new QPushButton(QStringLiteral("Eliminar"),editorCard);
     for(auto* b:{personalEdit_,personalSave_,copy,erase})actions->addWidget(b);
     right->addLayout(actions);
@@ -1471,8 +1494,12 @@ void MainWindow::buildVaults(){
     connect(personalSave_,&QPushButton::clicked,this,[this](){savePersonalItem();});
     connect(erase,&QPushButton::clicked,this,[this](){deletePersonalItem();});
     connect(copy,&QPushButton::clicked,this,[this](){
-        if(personalContent_->text().isEmpty())return;
-        QApplication::clipboard()->setText(personalContent_->text());
+        if(!personalAvailable_ || personalContent_->text().isEmpty())return;
+        auto* clipboard=QApplication::clipboard();
+        if(!clipboard)return;
+        clipboard->setText(personalContent_->text(),QClipboard::Clipboard);
+        personalClipboardDigest_=QCryptographicHash::hash(
+            personalContent_->text().toUtf8(),QCryptographicHash::Sha256);
         statusBar()->showMessage(translateText(QStringLiteral("Copiado al portapapeles")),3000);
     });
     setPersonalEditing(false);
@@ -1495,23 +1522,32 @@ void MainWindow::clearPersonalEditor(){
     if(personalReveal_)personalReveal_->setChecked(false);
     setPersonalEditing(false);
 }
-void MainWindow::refreshPersonalList(){
-    if(!personalList_)return;
+bool MainWindow::refreshPersonalList(){
+    if(!personalList_)return false;
     clearPersonalEditor();personalList_->clear();
     QString error;
     const auto status=call(QJsonObject{{QStringLiteral("op"),QStringLiteral("vault.status")}},&error);
+    const auto state=status.value(QStringLiteral("data")).toObject();
+    // An absent, incomplete or locked response must never leave My selectable.
     if(!status.value(QStringLiteral("ok")).toBool() ||
-       status.value(QStringLiteral("data")).toObject().value(QStringLiteral("locked")).toBool())return;
+       !state.value(QStringLiteral("initialized")).isBool() ||
+       !state.value(QStringLiteral("locked")).isBool() ||
+       !state.value(QStringLiteral("initialized")).toBool() ||
+       state.value(QStringLiteral("locked")).toBool()){
+        setPersonalAvailable(false);
+        return false;
+    }
     const auto result=call(QJsonObject{{QStringLiteral("op"),QStringLiteral("general.list")}},&error);
     if(!result.value(QStringLiteral("ok")).toBool()){
         QMessageBox::warning(this,QStringLiteral("My Secrets"),error.isEmpty()?errorText(result):error);
-        return;
+        return false;
     }
     const auto ids=result.value(QStringLiteral("data")).toObject().value(QStringLiteral("ids")).toArray();
     for(const auto& id:ids){
         auto* item=new QListWidgetItem(id.toString(),personalList_);
         item->setData(Qt::UserRole,id.toString());
     }
+    return true;
 }
 void MainWindow::openPersonalItem(QListWidgetItem* item){
     clearPersonalEditor();
