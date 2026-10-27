@@ -1,0 +1,23 @@
+{
+  "schema": 1,
+  "module": "neebles-secrets",
+  "version": "1.0.7",
+  "compiler": {
+    "rust": "1.98.1",
+    "qt": "6.8.2",
+    "qt_source": "Esbirro controlled sysroot (Bubblewrap)"
+  },
+  "artifacts_sha256": {
+    "runtime/neebles-secrets": "828d7d947b6af95b4a1ae599818a1be6b7b2fa085ebe16ffe4ee85075808ddbe",
+    "runtime/neebles-secrets-ui": "2d5c985890f54442a6933eebcfbd5029fe9b2d395f3788be62f488da8e7e9081",
+    "bin/neebles-secrets-desktop": "f7a8c49bb7f67a78666d059495107d34f48ff9c7e59e7364cf5d891f594bf467"
+  },
+  "commands": {
+    "health": "secrets.health.v1",
+    "vault_exists": "secrets.vault.exists.v1",
+    "vault_request_status": "secrets.vault.request_status.v1",
+    "vault_request": "secrets.vault.request.v1",
+    "structure_capabilities": "secrets.structure.capabilities.v1"
+  },
+  "note": "Restored Governor open owner model as in 1.0.4; Rust and Qt Esbirro certified. Real installed QA pending."
+}

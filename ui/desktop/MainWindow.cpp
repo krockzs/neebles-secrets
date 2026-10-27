@@ -142,7 +142,7 @@ static bool askMasterKey(QWidget* parent, bool setup, QString* output,
 }
 }
 MainWindow::MainWindow(QString moduleRoot,QWidget* parent):QMainWindow(parent),root_(std::move(moduleRoot)){
-    setWindowTitle(QStringLiteral("N.E.E.B.L.E.S. Secrets — 1.0.6"));
+    setWindowTitle(QStringLiteral("N.E.E.B.L.E.S. Secrets — 1.0.7"));
     setWindowIcon(QIcon(QDir(root_).filePath(QStringLiteral("assets/neebles-secrets-icon.png"))));
     setMinimumSize(1040,650);resize(1400,850);
     setStyleSheet(QStringLiteral(R"QSS(
@@ -196,7 +196,7 @@ MainWindow::MainWindow(QString moduleRoot,QWidget* parent):QMainWindow(parent),r
     unlock_->setObjectName(QStringLiteral("unlockButton"));
     unlock_->setVisible(false); // never show before vault-general exists
     left->addWidget(unlock_);
-    left->addWidget(note(QStringLiteral("Secrets v1.0.6"),sidebar));
+    left->addWidget(note(QStringLiteral("Secrets v1.0.7"),sidebar));
     row->addWidget(sidebar);
     auto* right=new QWidget(root);auto* rightLayout=new QVBoxLayout(right);
     auto* header=new QHBoxLayout();

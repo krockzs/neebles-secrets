@@ -6,28 +6,26 @@
       "visible": true,
       "data": {
         "control": "button",
-        "action": "show-ui",
+        "action": "open",
         "label_key": "surface.open"
       },
       "require": {
         "self": "active",
         "modules": {}
-      },
-      "transition": "show-ui"
+      }
     },
     "open.tray": {
       "surface": "tray",
       "visible": true,
       "data": {
         "control": "button",
-        "action": "show-ui",
+        "action": "open",
         "label_key": "surface.open"
       },
       "require": {
         "self": "active",
         "modules": {}
-      },
-      "transition": "show-ui"
+      }
     }
   }
 }

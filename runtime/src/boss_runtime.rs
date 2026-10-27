@@ -323,12 +323,12 @@ mod tests {
     }
     #[test]
     fn accepts_only_daemon_entrypoint_with_matching_version() {
-        let good = json!({"name":MODULE,"version":"1.0.6","entrypoint":ENTRYPOINT});
-        assert!(eligible_manifest(&good, "1.0.6"));
+        let good = json!({"name":MODULE,"version":"1.0.7","entrypoint":ENTRYPOINT});
+        assert!(eligible_manifest(&good, "1.0.7"));
         assert!(!eligible_manifest(&good, "1.0.4"));
         let mut ui = good.clone();
         ui["entrypoint"] = json!("runtime/neebles-secrets-ui");
-        assert!(!eligible_manifest(&ui, "1.0.6"));
+        assert!(!eligible_manifest(&ui, "1.0.7"));
     }
     #[test]
     fn response_scope_and_no_secret_leakage() {

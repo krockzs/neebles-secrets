@@ -47,19 +47,6 @@
           "intelligence": {}
         }
       }
-    },
-    "show-ui": {
-      "operations": {
-        "launch-ui": {
-          "artillery": "boss.workspace_execution",
-          "objective": "construction.step",
-          "munition": {
-            "step": "open-ui"
-          },
-          "tactics": {},
-          "intelligence": {}
-        }
-      }
     }
   }
 }
